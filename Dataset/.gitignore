@@ -1,0 +1,16 @@
+# Ignora la cartella dell'ambiente virtuale
+.venv/
+venv/
+ENV/
+
+# Ignora i file di configurazione di DataSpell/PyCharm
+.idea/
+
+# Ignora i file compilati di Python
+__pycache__/
+*.pyc
+
+# Ignora i Dataset Excel (per privacy e peso)
+*.xlsx
+*.xls
+*.csv
