@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from scipy.signal import medfilt
 import os
-<<<<<<< Updated upstream
+
 # --- 1. DATASET LOADING ---
 base_dir = os.path.dirname(os.path.abspath(__file__))
 data_folder = os.path.join(base_dir, "dataset iniziali e risultati")
@@ -11,7 +11,6 @@ filename_ASD = "results_cones_2D_ASD_unlabelled_31_10_2025_after.xlsx"
 # Define file paths (ensure these match your local directory)
 path_TD = os.path.join(data_folder, filename_TD)
 path_ASD = os.path.join(data_folder, filename_ASD)
-=======
 
 # --- 1. PATH CONFIGURATION ---
 # Specific path requested for OneDrive
@@ -26,8 +25,6 @@ if not os.path.exists(path_TD) or not os.path.exists(path_ASD):
     print(f"ERROR: Files not found in folder: {BASE_PATH}")
     print("Please check the filenames and directory path.")
     exit()
-
->>>>>>> Stashed changes
 try:
     print("Loading datasets...")
     df_TD = pd.read_excel(path_TD)
