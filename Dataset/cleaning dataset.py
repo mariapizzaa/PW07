@@ -1,3 +1,4 @@
+
 import pandas as pd
 import numpy as np
 from scipy.signal import medfilt
@@ -5,33 +6,26 @@ import os
 
 # --- 1. DATASET LOADING ---
 base_dir = os.path.dirname(os.path.abspath(__file__))
-data_folder = os.path.join(base_dir, "dataset iniziali e risultati")
+BASE_PATH = os.path.join(base_dir, "dataset iniziali e risultati")
 filename_TD = "results_cones_2D_TD_unlabelled_20_10_2025_after.xlsx"
 filename_ASD = "results_cones_2D_ASD_unlabelled_31_10_2025_after.xlsx"
 # Define file paths (ensure these match your local directory)
-path_TD = os.path.join(data_folder, filename_TD)
-path_ASD = os.path.join(data_folder, filename_ASD)
-
-# --- 1. PATH CONFIGURATION ---
-# Specific path requested for OneDrive
-BASE_PATH = os.path.dirname(os.path.abspath(__file__))
-
-# Construct full file paths
-path_TD = os.path.join(BASE_PATH, "results_cones_2D_TD_unlabelled_20_10_2025_after.xlsx")
-path_ASD = os.path.join(BASE_PATH, "results_cones_2D_ASD_unlabelled_31_10_2025_after.xlsx")
+path_TD = os.path.join(BASE_PATH, filename_TD)
+path_ASD = os.path.join(BASE_PATH, filename_ASD)
 
 # Safety check to prevent crashes
 if not os.path.exists(path_TD) or not os.path.exists(path_ASD):
-    print(f"ERROR: Files not found in folder: {BASE_PATH}")
+    print(f" ERROR: Files not found in folder: {BASE_PATH}")
     print("Please check the filenames and directory path.")
     exit()
+
 try:
     print("Loading datasets...")
     df_TD = pd.read_excel(path_TD)
     df_ASD = pd.read_excel(path_ASD)
-    print("Datasets loaded successfully.")
+    print(" Datasets loaded successfully.")
 except Exception as e:
-    print(f"Error loading Excel files: {e}")
+    print(f" Critical error loading Excel files: {e}")
     exit()
 
 
@@ -85,7 +79,7 @@ def preprocess_data_advanced(df_input, group_name):
                 df.loc[outliers, col] = np.nan
                 # print(f"   - Outliers removed in {col}: {outliers.sum()}")
 
-    # E. MISSING VALUES IMPUTATION: Linear Interpolation
+    # E. MISSING VALUES IMPUTATION:
     # We limit interpolation to 60 frames (approx. 2 seconds) to avoid inventing data
     LIMIT_FRAMES = 60
     cols_to_process = cols_gaze + cols_3d
@@ -130,8 +124,8 @@ print("\nSaving files...")
 try:
     df_TD_clean.to_excel(output_TD, index=False)
     df_ASD_clean.to_excel(output_ASD, index=False)
-    print(f"Done! Files saved in: {BASE_PATH}")
+    print(f" Done! Files saved in: {BASE_PATH}")
     print(f"   - {os.path.basename(output_TD)}")
     print(f"   - {os.path.basename(output_ASD)}")
 except Exception as e:
-    print(f"Error saving files: {e}")
+    print(f" Error saving files: {e}")
