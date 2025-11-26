@@ -1,0 +1,258 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+import os
+
+# =============================================================================
+# 1. SETTINGS AND DATA LOADING
+# =============================================================================
+
+# Define the base directory containing your datasets
+BASE_PATH = r"C:\Users\user\Desktop\PW2025\Students\Students\Dataset"
+
+# Define file names
+FILE_ASD_NAME = "results_cones_2D_ASD_unlabelled_31_10_2025_after.xlsx"
+FILE_TD_NAME = "results_cones_2D_TD_unlabelled_20_10_2025_after.xlsx"
+
+# Combine paths
+FILE_ASD = os.path.join(BASE_PATH, FILE_ASD_NAME)
+FILE_TD = os.path.join(BASE_PATH, FILE_TD_NAME)
+
+# Visualization settings
+sns.set_style("whitegrid")
+plt.rcParams.update({'figure.max_open_warning': 0})
+
+# --- Analysis Parameters (Relaxed Filters) ---
+# Lowered confidence threshold to include more data (even if slightly noisy)
+CONF_THRESHOLD = 0.2
+# Lowered minimum valid ratio: If a subject has at least 1% valid data, include them.
+MIN_VALID_RATIO = 0.01
+
+# Region of Interest (ROI) Thresholds based on Yaw/Pitch values
+THR_LEFT = -1.01  # Gaze limit for left side
+THR_RIGHT = 0.11  # Gaze limit for right side
+THR_PITCH_DOWN = -0.75  # Vertical threshold separating Toy (down) and Robot (up)
+
+
+# =============================================================================
+# 2. FUNCTIONS (FEATURE EXTRACTION & CLEANING)
+# =============================================================================
+
+def calculate_effect_size(group1, group2):
+    """
+    Calculates Cohen's d to measure the effect size between two groups.
+    Formula: (Mean1 - Mean2) / Pooled Standard Deviation
+    """
+    if len(group1) < 2 or len(group2) < 2: return 0.0
+    diff = group1.mean() - group2.mean()
+    pooled_std = np.sqrt((group1.std() ** 2 + group2.std() ** 2) / 2)
+    if pooled_std == 0: return 0.0
+    return diff / pooled_std
+
+
+def analyze_subject(df):
+    """
+    Processes raw gaze data for a single subject.
+    Performs data cleaning, ROI classification, and temporal analysis.
+    """
+    # Clean whitespace from column names
+    df.columns = [c.strip() for c in df.columns]
+
+    total_frames = len(df)
+    if total_frames == 0: return None
+
+    # 1. DATA CLEANING
+    # Filter out frames where OpenFace confidence is too low
+    df_clean = df[(df['confidence_yaw'] > CONF_THRESHOLD) & (df['confidence_pitch'] > CONF_THRESHOLD)].copy()
+    valid_count = len(df_clean)
+    valid_ratio = valid_count / total_frames
+
+    # If valid data is extremely low (less than 5 frames), return only the ratio
+    if valid_count < 5:
+        return pd.Series({'Valid_Ratio': valid_ratio})
+
+    # 2. ROI CLASSIFICATION (Feature Extraction)
+    # Classify each frame into 'Robot', 'Toy', or 'Distractor' based on coordinates
+    def classify_roi(row):
+        if row['yaw'] < THR_LEFT or row['yaw'] > THR_RIGHT:
+            return 'Distractor'  # Looking away (too far left or right)
+        else:
+            # If centered horizontally, check vertical pitch
+            return 'Toy' if row['pitch'] < THR_PITCH_DOWN else 'Robot'
+
+    df_clean['ROI'] = df_clean.apply(classify_roi, axis=1)
+
+    # 3. TEMPORAL DYNAMICS (Time Analysis)
+    # Calculate how often the gaze target changes (Switch Rate)
+    df_clean['ROI_Shifted'] = df_clean['ROI'].shift(1)
+    # Count frames where current ROI is different from previous ROI
+    switches = (df_clean['ROI'] != df_clean['ROI_Shifted']).sum()
+    # Calculate Hz (switches per second), assuming 30 FPS video
+    switch_rate = switches / (valid_count / 30)
+
+    counts = df_clean['ROI'].value_counts()
+
+    # Return normalized ratios
+    return pd.Series({
+        'Robot_Ratio': counts.get('Robot', 0) / valid_count,
+        'Toy_Ratio': counts.get('Toy', 0) / valid_count,
+        'Engagement_Ratio': (counts.get('Robot', 0) + counts.get('Toy', 0)) / valid_count,
+        'Distractor_Ratio': counts.get('Distractor', 0) / valid_count,
+        'Switch_Rate_Hz': switch_rate,
+        'Valid_Ratio': valid_ratio
+    })
+
+
+# =============================================================================
+# 3. MAIN EXECUTION FLOW
+# =============================================================================
+
+print("--- 1. Loading Data ---")
+
+# Check if files exist
+if not os.path.exists(FILE_ASD):
+    print(f"ERROR: ASD file not found -> {FILE_ASD}");
+    exit()
+if not os.path.exists(FILE_TD):
+    print(f"ERROR: TD file not found -> {FILE_TD}");
+    exit()
+
+# Try loading ASD file (Try Excel first, then CSV)
+try:
+    df_asd_raw = pd.read_excel(FILE_ASD)
+    print(f"ASD data loaded (Excel): {len(df_asd_raw)} rows")
+except:
+    df_asd_raw = pd.read_csv(FILE_ASD)
+    print(f"ASD data loaded (CSV): {len(df_asd_raw)} rows")
+
+# Try loading TD file
+try:
+    df_td_raw = pd.read_excel(FILE_TD)
+    print(f"TD data loaded (Excel): {len(df_td_raw)} rows")
+except:
+    df_td_raw = pd.read_csv(FILE_TD)
+    print(f"TD data loaded (CSV): {len(df_td_raw)} rows")
+
+print("--- 2. Extracting Features ---")
+
+# Group by Subject ID and apply analysis function
+res_asd = df_asd_raw.groupby("id_soggetto").apply(analyze_subject).reset_index()
+res_asd['Group'] = 'ASD'
+
+res_td = df_td_raw.groupby("id_soggetto").apply(analyze_subject).reset_index()
+res_td['Group'] = 'TD'
+
+# Combine results
+df_results = pd.concat([res_asd, res_td], ignore_index=True)
+
+# Count before filtering
+n_asd_raw = len(res_asd)
+n_td_raw = len(res_td)
+
+# Filter out low-quality subjects (Outlier Removal)
+df_results = df_results[df_results['Valid_Ratio'] > MIN_VALID_RATIO]
+
+# Count after filtering
+n_asd_final = len(df_results[df_results['Group'] == 'ASD'])
+n_td_final = len(df_results[df_results['Group'] == 'TD'])
+
+print(f"Participant Analysis:")
+print(f"ASD: Initial {n_asd_raw} -> Remaining {n_asd_final}")
+print(f"TD : Initial {n_td_raw} -> Remaining {n_td_final}")
+
+if n_td_final < 3:
+    print("\nWARNING: Still insufficient data in TD group. 'confidence' values might be extremely low.")
+    print("Checking first 5 rows of raw TD data for debugging:")
+    print(df_td_raw[['confidence_yaw', 'confidence_pitch']].head())
+
+# =============================================================================
+# 4. VISUALIZATION (EDA)
+# =============================================================================
+
+if n_asd_final > 0 and n_td_final > 0:
+    print("--- 3. Generating Plots ---")
+
+    # A. Heatmap (To validate threshold lines)
+    plt.figure(figsize=(10, 6))
+    combined_raw = pd.concat([
+        df_asd_raw[(df_asd_raw['confidence_yaw'] > CONF_THRESHOLD)][['yaw', 'pitch']],
+        df_td_raw[(df_td_raw['confidence_yaw'] > CONF_THRESHOLD)][['yaw', 'pitch']]
+    ])
+
+    if not combined_raw.empty:
+        plt.hist2d(combined_raw['yaw'], combined_raw['pitch'], bins=80, cmap='inferno', range=[[-2, 2], [-2, 2]])
+        plt.colorbar(label='Gaze Density')
+        plt.axvline(x=THR_LEFT, color='cyan', linestyle='--', label='Left Boundary')
+        plt.axvline(x=THR_RIGHT, color='cyan', linestyle='--', label='Right Boundary')
+        plt.axhline(y=THR_PITCH_DOWN, color='lime', linestyle='--', label='Toy Boundary')
+        plt.title(f'Gaze Heatmap & ROI Boundaries (Confidence > {CONF_THRESHOLD})')
+        plt.xlabel('Yaw (Horizontal)')
+        plt.ylabel('Pitch (Vertical)')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    # B. Box Plots (Group Comparison)
+    metrics_to_plot = ['Engagement_Ratio', 'Distractor_Ratio', 'Switch_Rate_Hz']
+    plt.figure(figsize=(15, 5))
+    for i, metric in enumerate(metrics_to_plot):
+        plt.subplot(1, 3, i + 1)
+        sns.boxplot(x='Group', y=metric, data=df_results, palette="Set2", showfliers=False)
+        sns.stripplot(x='Group', y=metric, data=df_results, color='black', alpha=0.5, jitter=True)
+        plt.title(metric.replace('_', ' '))
+        plt.ylabel('Value')
+    plt.tight_layout()
+    plt.show()
+
+# =============================================================================
+# 5. STATISTICAL ANALYSIS
+# =============================================================================
+
+print("\n" + "=" * 100)
+print(f"{'METRIC':<20} | {'ASD Mean (SD)':<20} | {'TD Mean (SD)':<20} | {'P-VALUE':<10} | {'EFFECT (d)':<10}")
+print("=" * 100)
+
+metrics_list = ['Robot_Ratio', 'Toy_Ratio', 'Engagement_Ratio', 'Distractor_Ratio', 'Switch_Rate_Hz']
+
+for m in metrics_list:
+    # Separate groups
+    vals_asd = df_results[df_results['Group'] == 'ASD'][m].dropna()
+    vals_td = df_results[df_results['Group'] == 'TD'][m].dropna()
+
+    # Check for sufficient sample size (n >= 2)
+    if len(vals_asd) < 2 or len(vals_td) < 2:
+        print(f"{m:<20} | Insufficient Data     | Insufficient Data     | -          | -")
+        continue
+
+    # Normality Check (Shapiro-Wilk)
+    # If p > 0.05, data is Normal -> Use T-Test
+    # If p < 0.05, data is NOT Normal -> Use Mann-Whitney U
+    try:
+        _, p_norm_asd = stats.shapiro(vals_asd)
+        _, p_norm_td = stats.shapiro(vals_td)
+    except:
+        p_norm_asd, p_norm_td = 0, 0
+
+    if p_norm_asd > 0.05 and p_norm_td > 0.05:
+        stat, p = stats.ttest_ind(vals_asd, vals_td)
+    else:
+        stat, p = stats.mannwhitneyu(vals_asd, vals_td)
+
+    # Calculate Effect Size
+    d = calculate_effect_size(vals_asd, vals_td)
+
+    # Format strings
+    asd_desc = f"{vals_asd.mean():.3f} (±{vals_asd.std():.3f})"
+    td_desc = f"{vals_td.mean():.3f} (±{vals_td.std():.3f})"
+
+    # Significance markers
+    sig_mark = ""
+    if p < 0.05: sig_mark = "*"
+    if p < 0.01: sig_mark = "**"
+
+    print(f"{m:<20} | {asd_desc:<20} | {td_desc:<20} | {p:.4f} {sig_mark:<2} | {d:.3f}")
+
+print("=" * 100)
+print("Legend: * p < 0.05 (Significant), ** p < 0.01 (Highly Significant)")
