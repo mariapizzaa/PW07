@@ -1,186 +1,263 @@
-import pandas as pd
-import numpy as np
+"""
+ASC_rate computation script
+
+This script computes ASC_rate (Area-of-interest Switch Count *per AOI frame*)
+for TD and ASD groups, following the logic of the ASC metric described in the
+eye-tracking article you are using.
+
+Main idea (from the article):
+--------------------------------
+- ASC measures how often the gaze switches from one AOI to another.
+- Here we normalize ASC by the number of AOI frames, obtaining ASC_rate:
+      ASC_rate = (number of AOI-to-AOI switches) / (number of AOI frames)
+
+Author: you :)
+"""
+
 import os
-from scipy.stats import mannwhitneyu
-import matplotlib.pyplot as plt
-import seaborn as sns
+import numpy as np
+import pandas as pd
+from scipy.stats import ttest_ind, mannwhitneyu
 
-# =============================================================================
-# 1. CONFIGURATION AND PATHS
-# =============================================================================
+# ============================================================
+# 1. PATHS AND FILE NAMES
+# ============================================================
+
+# We assume this script is saved in the same folder as "cleaning dataset.py".
+# The cleaned Excel files are stored in the subfolder:
+#   "dataset iniziali e risultati"
 base_dir = os.path.dirname(os.path.abspath(__file__))
-data_folder = os.path.join(base_dir, "dataset iniziali e risultati")
+DATA_DIR = os.path.join(base_dir, "dataset iniziali e risultati")
 
-# Paths to the preprocessed datasets (Cleaned & Advanced)
-path_TD = os.path.join(data_folder, "TD_cleaned_advanced.xlsx")
-path_ASD = os.path.join(data_folder, "ASD_cleaned_advanced.xlsx")
+# File names produced by the cleaning script
+TD_FILENAME = "TD_cleaned_advanced.xlsx"
+ASD_FILENAME = "ASD_cleaned_advanced.xlsx"
 
-# --- GEOMETRIC THRESHOLDS FOR "VALID ATTENTION ZONE" ---
-# We define a broad spatial area that encompasses all task-relevant targets
-# (Robot, Therapist, Posters, Table). Gaze outside this area is considered "Vacancy".
+td_path = os.path.join(DATA_DIR, TD_FILENAME)
+asd_path = os.path.join(DATA_DIR, ASD_FILENAME)
 
-# Horizontal Limit (Yaw): +/- 1.5 rad (approx. 85 degrees)
-# Wide enough to include lateral posters but excludes looking behind/extreme sides.
-YAW_LIMIT = 1.5
+if not os.path.exists(td_path) or not os.path.exists(asd_path):
+    raise FileNotFoundError(
+        "Could not find the cleaned datasets.\n"
+        f"  TD:  {td_path}\n"
+        f"  ASD: {asd_path}\n"
+        "Please check that your cleaning script saved them with these names."
+    )
 
-# Vertical Limits (Pitch): From -1.3 (deep table view) to +0.6 (Therapist's face)
-# Excludes looking at the floor (too low) or the ceiling (too high).
-PITCH_MIN = -1.3
-PITCH_MAX = 0.6
+print("Loading cleaned datasets...")
+df_td = pd.read_excel(td_path)
+df_asd = pd.read_excel(asd_path)
+print("   TD shape:", df_td.shape)
+print("   ASD shape:", df_asd.shape, "\n")
 
-# Confidence Threshold: Filters out low-quality gaze estimations
-CONF_THRESH = 0.15
+# ============================================================
+# 2. COLUMN NAMES AND AOI LABELS
+# ============================================================
 
-# Temporal Filter (Anti-Jitter)
-# We ignore "Vacancy" events shorter than 5 frames (~150ms) to reduce sensor noise.
-MIN_VACANCY_DURATION = 5
+# These column names reflect your cleaned files.
+# If your actual column names differ, update them here.
+ID_COL = "id_soggetto"      # subject identifier
+FRAME_COL = "frame_cutted"  # temporal order (frame index)
+LABEL_COL = "label"         # AOI label (robot, giocattolo, poster_dx, ...)
 
+# Basic checks to ensure the required columns exist
+for name, df in [("TD", df_td), ("ASD", df_asd)]:
+    for col in (ID_COL, FRAME_COL, LABEL_COL):
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' is missing in {name} dataset.")
 
-# =============================================================================
-# 2. HELPER FUNCTIONS
-# =============================================================================
+# We build the set of AOI labels directly from the data.
+# This is safer than hard-coding names, and will adapt if you change labels.
+all_labels = pd.concat(
+    [df_td[LABEL_COL], df_asd[LABEL_COL]],
+    axis=0
+)
 
-def smart_load(filepath):
-    """Loads Excel files safely, handling path errors."""
-    if not os.path.exists(filepath): return None
-    try:
-        return pd.read_excel(filepath)
-    except:
-        return None
+# Convert to strings, strip spaces, and lowercase.
+all_labels = (
+    all_labels
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .str.lower()
+)
 
+unique_labels = sorted(all_labels.unique())
 
-def calculate_avc_metric(df):
+# Labels that are NOT AOIs (e.g., gaze outside any region of interest).
+# These labels will be excluded when computing ASC_rate.
+NON_AOI = {"nowhere", "none", "background"}
+
+# AOI labels are all labels that are not in NON_AOI.
+AOI_LABELS = [lab for lab in unique_labels if lab not in NON_AOI]
+
+print("AOI labels found in the datasets (used for ASC_rate):")
+for lab in AOI_LABELS:
+    print("  -", lab)
+print()
+
+if not AOI_LABELS:
+    raise ValueError(
+        "No valid AOI labels were found (AOI_LABELS is empty). "
+        "Check the content of the 'label' column."
+    )
+
+# For consistency, also normalize labels in the dataframes (lowercase, stripped)
+df_td[LABEL_COL] = df_td[LABEL_COL].astype(str).str.strip().str.lower()
+df_asd[LABEL_COL] = df_asd[LABEL_COL].astype(str).str.strip().str.lower()
+
+# ============================================================
+# 3. FUNCTION TO COMPUTE ASC_rate
+# ============================================================
+
+def compute_asc_rate_per_subject(df: pd.DataFrame, group_name: str) -> pd.DataFrame:
     """
-    Calculates the AVC (AOI Vacancy Count) Ratio for a single subject.
+    Compute ASC_rate for each subject in a given group (TD or ASD).
 
-    Returns:
-        float: The ratio of time (0.0 - 1.0) the subject spent in 'Vacancy' (Disengagement).
+    According to the article:
+    -------------------------
+    - ASC = number of times the gaze switches from one AOI to another AOI.
+    - We only consider AOI frames (frames where the label is one of the AOI_LABELS).
+    - Consecutive AOI frames with the same label do NOT count as a switch.
+    - Here we compute ASC_rate = ASC / N_AOI_FRAMES.
+
+    Parameters
+    ----------
+    df : DataFrame
+        The cleaned eye-tracking data for one group (TD or ASD).
+    group_name : str
+        Just for printing/logging ("TD" or "ASD").
+
+    Returns
+    -------
+    result_df : DataFrame
+        One row per subject with:
+        - id_soggetto
+        - ASC (raw number of switches)
+        - n_AOI_frames (number of frames with a valid AOI label)
+        - ASC_rate (switches per AOI frame)
     """
-    # A. Filter valid data based on sensor confidence
-    valid_mask = (df['confidence_yaw'] > CONF_THRESH) & (df['confidence_pitch'] > CONF_THRESH)
-    df_clean = df[valid_mask].copy()
 
-    total_valid_frames = len(df_clean)
-    # Skip subjects with insufficient data (< 50 frames) to avoid statistical artifacts
-    if total_valid_frames < 50: return None
-
-    # B. Identify Valid Attention (Inside the Geometric Zone)
-    # Check if gaze is within Horizontal limits
-    is_inside_yaw = df_clean['yaw'].abs() <= YAW_LIMIT
-    # Check if gaze is within Vertical limits
-    is_inside_pitch = (df_clean['pitch'] >= PITCH_MIN) & (df_clean['pitch'] <= PITCH_MAX)
-
-    # A frame is "Attention" if it satisfies BOTH spatial conditions
-    is_attention = is_inside_yaw & is_inside_pitch
-
-    # C. Signal Stabilization (Noise Removal)
-    # We want to count Vacancy only if the gaze actually leaves the zone for a meaningful time.
-    # 's_vac' is True when the child is NOT looking at the task.
-    s_vac = pd.Series(~is_attention)
-
-    # Rolling Window Filter:
-    # If a window of N frames contains ANY Attention frame (0), the minimum becomes 0.
-    # This effectively erodes short spikes of Vacancy (noise/blinks).
-    is_stable_vacancy = s_vac.rolling(window=MIN_VACANCY_DURATION, center=True).min().fillna(0).astype(bool)
-
-    # D. Final Calculation
-    vacancy_frames = is_stable_vacancy.sum()
-
-    # Ratio = Vacancy Frames / Total Valid Frames
-    avc_ratio = vacancy_frames / total_valid_frames
-
-    return avc_ratio
-
-
-def process_group(path, group_name):
-    """Iterates through all subjects in a group dataset."""
-    df = smart_load(path)
-    if df is None: return []
-
-    print(f"Processing Group: {group_name}...")
     results = []
 
-    for subj in df['id_soggetto'].unique():
-        df_subj = df[df['id_soggetto'] == subj]
+    # Group by subject
+    for subject_id, df_sub in df.groupby(ID_COL):
 
-        # Compute metric for this subject
-        avc = calculate_avc_metric(df_subj)
+        # 1) Sort by frame index to respect temporal order
+        df_sub = df_sub.sort_values(FRAME_COL)
 
-        if avc is not None:
-            results.append({
-                'Subject_ID': subj,
-                'Group': group_name,
-                'AVC_Ratio': avc
-            })
+        # 2) Keep only rows where label is one of the AOI labels
+        df_aoi = df_sub[df_sub[LABEL_COL].isin(AOI_LABELS)].copy()
 
-    return results
+        # Total number of AOI frames for this subject
+        n_aoi_frames = len(df_aoi)
 
+        # If there are fewer than 2 AOI frames, no switches can occur
+        if n_aoi_frames <= 1:
+            asc = 0
+            asc_rate = 0.0
 
-# =============================================================================
-# 3. MAIN EXECUTION
-# =============================================================================
-if __name__ == "__main__":
-    # 1. Compute Metrics for both groups
-    res_td = process_group(path_TD, "TD")
-    res_asd = process_group(path_ASD, "ASD")
-
-    if res_td and res_asd:
-        # Combine results into a single DataFrame
-        df_final = pd.concat([pd.DataFrame(res_td), pd.DataFrame(res_asd)], ignore_index=True)
-
-        # Save Final Results to Excel
-        out_file = os.path.join(base_dir, "Final_AVC_Optimized.xlsx")
-        df_final.to_excel(out_file, index=False)
-
-        # 2. Statistical Analysis (Mann-Whitney U Test)
-        td_vals = df_final[df_final['Group'] == 'TD']['AVC_Ratio']
-        asd_vals = df_final[df_final['Group'] == 'ASD']['AVC_Ratio']
-
-        # Hypothesis: ASD > TD (One-sided test 'greater')
-        stat, p_value = mannwhitneyu(asd_vals, td_vals, alternative='greater')
-
-        # 3. Print Report
-        print("\n" + "=" * 60)
-        print("AVC RESULTS (OPTIMIZED DISTRACTION RATIO)")
-        print("=" * 60)
-        print(f"TD Mean:  {td_vals.mean():.4f} (±{td_vals.std():.3f})")
-        print(f"ASD Mean: {asd_vals.mean():.4f} (±{asd_vals.std():.3f})")
-        print("-" * 60)
-        print(f"Mann-Whitney U Test (Hypothesis: ASD > TD):")
-        print(f"U-stat: {stat}")
-
-        # Significance stars
-        sig = "***" if p_value < 0.001 else "**" if p_value < 0.01 else "*" if p_value < 0.05 else "ns"
-        print(f"P-value: {p_value:.5f}  [{sig}]")
-
-        if p_value < 0.05:
-            print("\n✅ SIGNIFICANT RESULT! Hypothesis confirmed.")
         else:
-            print("\n❌ No significant difference found.")
+            # 3) Extract the AOI sequence as a numpy array
+            aoi_seq = df_aoi[LABEL_COL].to_numpy()
 
-        # 4. Generate Visualization (Boxplot)
-        plt.figure(figsize=(6, 6))
-        sns.set_style("whitegrid")
+            # 4) Compute where the label changes between consecutive AOI frames:
+            #    changes[i] is True when aoi_seq[i+1] != aoi_seq[i]
+            changes = aoi_seq[1:] != aoi_seq[:-1]
 
-        # Draw Boxplot
-        ax = sns.boxplot(data=df_final, x='Group', y='AVC_Ratio', palette='Set2', showfliers=False)
-        # Overlay individual data points (Swarmplot)
-        sns.swarmplot(data=df_final, x='Group', y='AVC_Ratio', color='.25', size=6)
+            # 5) ASC is the number of such changes (AOI-to-AOI switches)
+            asc = int(changes.sum())
 
-        # Add statistical annotation bracket
-        y_max = df_final['AVC_Ratio'].max()
-        h = 0.02
-        plt.plot([0, 0, 1, 1], [y_max + h, y_max + 2 * h, y_max + 2 * h, y_max + h], lw=1.5, c='k')
-        plt.text(0.5, y_max + 2.5 * h, f"p = {p_value:.4f} [{sig}]", ha='center', va='bottom')
+            # 6) ASC_rate = ASC / number of AOI frames
+            #    (this normalizes for how long the subject actually spent on AOIs)
+            asc_rate = asc / float(n_aoi_frames)
 
-        plt.title("AOI Vacancy Ratio (Visual Disengagement)")
-        plt.ylabel("AVC Ratio (0-1)")
-        plt.ylim(top=y_max + 0.15)
+        results.append(
+            {
+                ID_COL: subject_id,
+                "ASC": asc,
+                "n_AOI_frames": n_aoi_frames,
+                "ASC_rate": asc_rate,
+            }
+        )
 
-        # Save Plot
-        out_img = os.path.join(base_dir, "AVC_Boxplot_Optimized.png")
-        plt.savefig(out_img, dpi=300)
-        print(f"Chart saved to: {out_img}")
+    result_df = pd.DataFrame(results).sort_values(ID_COL).reset_index(drop=True)
+    print(f"{group_name}: computed ASC_rate for {len(result_df)} subjects.")
+    return result_df
 
-    else:
-        print("Error: Missing data.")
+# ============================================================
+# 4. COMPUTE ASC_rate FOR TD AND ASD
+# ============================================================
+
+asc_td = compute_asc_rate_per_subject(df_td, "TD")
+asc_asd = compute_asc_rate_per_subject(df_asd, "ASD")
+
+print("\n--- Descriptive statistics for ASC_rate ---")
+print("TD  - N subjects:", len(asc_td),
+      "  mean:", asc_td["ASC_rate"].mean(),
+      "  sd:", asc_td["ASC_rate"].std(),
+      "  median:", asc_td["ASC_rate"].median())
+print("ASD - N subjects:", len(asc_asd),
+      "  mean:", asc_asd["ASC_rate"].mean(),
+      "  sd:", asc_asd["ASC_rate"].std(),
+      "  median:", asc_asd["ASC_rate"].median())
+
+# ============================================================
+# 5. STATISTICAL TESTS ON ASC_rate (TD vs ASD)
+# ============================================================
+
+def compare_groups_on_asc_rate(td_df: pd.DataFrame, asd_df: pd.DataFrame) -> None:
+    """
+    Compare TD and ASD groups on ASC_rate using:
+
+    - Welch's t-test (does not assume equal variances)
+    - Mann–Whitney U test (non-parametric)
+
+    This is consistent with the article's approach of comparing
+    eye-tracking metrics between groups.
+    """
+
+    td_vals = td_df["ASC_rate"].to_numpy(dtype=float)
+    asd_vals = asd_df["ASC_rate"].to_numpy(dtype=float)
+
+    # Remove any possible NaNs (should not be present, but just in case)
+    td_vals = td_vals[~np.isnan(td_vals)]
+    asd_vals = asd_vals[~np.isnan(asd_vals)]
+
+    print("\n--- Group comparison on ASC_rate ---")
+    print("Sample sizes: TD =", len(td_vals), " ASD =", len(asd_vals))
+
+    if len(td_vals) < 2 or len(asd_vals) < 2:
+        print("Not enough data in one of the groups to run statistical tests.")
+        return
+
+    # Check for degenerate case where all values are identical in both groups
+    if np.all(td_vals == td_vals[0]) and np.all(asd_vals == asd_vals[0]):
+        print("All ASC_rate values are identical in both groups; no variance.")
+        print("Statistical tests would not be meaningful in this case.")
+        return
+
+    # Welch's t-test (robust to unequal variances)
+    t_stat, p_t = ttest_ind(td_vals, asd_vals, equal_var=False)
+    print(f"Welch's t-test: t = {t_stat:.3f}, p = {p_t:.5f}")
+
+    # Mann–Whitney U test (non-parametric)
+    u_stat, p_u = mannwhitneyu(td_vals, asd_vals, alternative="two-sided")
+    print(f"Mann–Whitney U: U = {u_stat:.3f}, p = {p_u:.5f}")
+
+compare_groups_on_asc_rate(asc_td, asc_asd)
+
+# ============================================================
+# 6. SAVE RESULTS TO EXCEL
+# ============================================================
+
+td_out = os.path.join(DATA_DIR, "ASC_rate_TD_per_subject.xlsx")
+asd_out = os.path.join(DATA_DIR, "ASC_rate_ASD_per_subject.xlsx")
+
+asc_td.to_excel(td_out, index=False)
+asc_asd.to_excel(asd_out, index=False)
+
+print("\nASC_rate results saved to:")
+print("  TD: ", td_out)
+print("  ASD:", asd_out)
+print("\nDone ✅")
