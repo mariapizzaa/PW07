@@ -5,10 +5,12 @@ import os
 # --- 1. SETUP PATHS ---
 # Uses relative paths assuming this script is in the same folder as the cleaned files
 base_dir = os.path.dirname(os.path.abspath(__file__))
+base_dire = os.path.join(base_dir, "dataset iniziali e risultati")
+
 # Note: If cleaned files are in a subfolder, adjust this line (e.g., os.path.join(base_dir, "Dataset", "dataset iniziali..."))
 # For now, we assume they are where we saved them in the previous step
-path_TD_clean = os.path.join(base_dir,  "TD_cleaned_advanced.xlsx")
-path_ASD_clean = os.path.join(base_dir, "ASD_cleaned_advanced.xlsx")
+path_TD_clean = os.path.join(base_dire,  "TD_cleaned_advanced.xlsx")
+path_ASD_clean = os.path.join(base_dire, "ASD_cleaned_advanced.xlsx")
 
 
 # --- 2. ENERGY FUNCTION (Single Subject) ---
