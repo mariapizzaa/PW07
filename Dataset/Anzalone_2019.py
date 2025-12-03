@@ -53,7 +53,9 @@ def calculate_energy_for_subject(df_subject):
     dist_sq = dx ** 2 + dy ** 2 + dz ** 2
 
     # Calculate velocity only where dt > 0
-    velocity_sq = np.zeros(len(df)) * np.nan  # Initialize with NaNs
+    DT_SEC = 1.0 / 9.0
+
+    velocity_sq = dist_sq / (DT_SEC ** 2)
     velocity_sq[valid_mask] = dist_sq[valid_mask] / (df.loc[valid_mask, 'dt'] ** 2)
 
     df['energy_translational'] = 0.5 * HEAD_MASS_KG * velocity_sq
@@ -67,7 +69,7 @@ def calculate_energy_for_subject(df_subject):
 
     ang_dist_sq = d_yaw ** 2 + d_pitch ** 2
 
-    ang_vel_sq = np.zeros(len(df)) * np.nan
+    ang_vel_sq = ang_dist_sq / (DT_SEC ** 2)
     ang_vel_sq[valid_mask] = ang_dist_sq[valid_mask] / (df.loc[valid_mask, 'dt'] ** 2)
 
     df['energy_rotational'] = 0.5 * HEAD_INERTIA * ang_vel_sq

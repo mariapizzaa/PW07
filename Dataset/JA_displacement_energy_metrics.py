@@ -98,7 +98,9 @@ def compute_metrics_for_subject(df_subj):
 
     dist_sq = dx**2 + dy**2 + dz**2
 
-    vel_sq = np.full(len(df), np.nan)
+    DT_SEC = 1.0 / 9.0
+
+    vel_sq = dist_sq / (DT_SEC ** 2)
     vel_sq[valid] = dist_sq[valid] / (dt[valid] ** 2)
 
     energy_trans = 0.5 * HEAD_MASS_KG * vel_sq
@@ -115,7 +117,7 @@ def compute_metrics_for_subject(df_subj):
 
     ang_dist_sq = d_yaw**2 + d_pitch**2
 
-    ang_vel_sq = np.full(len(df), np.nan)
+    ang_vel_sq  = ang_dist_sq / (DT_SEC ** 2)
     ang_vel_sq[valid] = ang_dist_sq[valid] / (dt[valid] ** 2)
 
     energy_rot = 0.5 * HEAD_INERTIA * ang_vel_sq
