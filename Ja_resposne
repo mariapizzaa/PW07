@@ -1,0 +1,260 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import mannwhitneyu
+import os
+
+# ============================================================
+# 1. PHYSICAL CONSTANTS
+# ============================================================
+TOTAL_MASS_KG = 25.0
+HEAD_MASS_KG = TOTAL_MASS_KG * 0.0668
+HEAD_RADIUS_M = 0.0835
+HEAD_INERTIA = 0.4 * HEAD_MASS_KG * (HEAD_RADIUS_M ** 2)
+FPS = 9.0  # Frame rate (Confirmed from data analysis)
+
+# ============================================================
+# 2. DATA LOADING AND PREPARATION
+# ============================================================
+
+# --- FILE PATHS (UPDATED FOR YOUR LOCAL MACHINE) ---
+# Using r"" (raw strings) to handle Windows backslashes correctly
+base_path = r"C:\Users\user\Desktop\PW2025\Students\Students\Dataset"
+
+path_cones_asd = os.path.join(base_path, "ASD_cleaned.xlsx")
+path_cones_td = os.path.join(base_path, "TD_cleaned.xlsx")
+path_vis_asd = os.path.join(base_path, "Visual_Analysis_ASD_after.xlsx")
+path_vis_td = os.path.join(base_path, "Visual_Analysis_TD_after.xlsx")
+
+
+def load_data(filepath):
+    print(f"Loading: {filepath}...")
+    try:
+        # Check file extension to use correct pandas function
+        if filepath.endswith('.csv'):
+            return pd.read_csv(filepath)
+        elif filepath.endswith('.xlsx'):
+            return pd.read_excel(filepath)
+        else:
+            print(f"Unsupported file format: {filepath}")
+            return pd.DataFrame()
+    except Exception as e:
+        print(f"Error loading {filepath}: {e}")
+        return pd.DataFrame()
+
+
+# Load Data
+df_cones_asd = load_data(path_cones_asd)
+df_cones_td = load_data(path_cones_td)
+df_vis_asd = load_data(path_vis_asd)
+df_vis_td = load_data(path_vis_td)
+
+# Label Groups
+df_cones_asd['Group'] = 'ASD'
+df_cones_td['Group'] = 'TD'
+df_vis_asd['Group'] = 'ASD'
+df_vis_td['Group'] = 'TD'
+
+# Merge Datasets
+df_cones_all = pd.concat([df_cones_asd, df_cones_td], ignore_index=True)
+df_vis_all = pd.concat([df_vis_asd, df_vis_td], ignore_index=True)
+
+# Standardize Column Names (Ensure consistency between files)
+# Renaming: id_soggetto -> Subject, frame -> Frame, timestamp -> Timestamp
+df_cones_all.rename(columns={'id_soggetto': 'Subject', 'frame': 'Frame', 'timestamp': 'Timestamp'}, inplace=True)
+
+
+# ============================================================
+# 3. ROBUST ENERGY CALCULATION
+# ============================================================
+def clean_and_calculate_energy(df):
+    """
+    This function processes each subject individually:
+    1. Imputes missing data (Interpolation).
+    2. Calculates velocity and energy using fixed FPS (9.0).
+    3. Smooths the signal to remove sensor noise.
+    """
+    # Sort by frame to ensure temporal order
+    df = df.sort_values("Frame").reset_index(drop=True)
+
+    # --- A. MISSING DATA IMPUTATION (INTERPOLATION) ---
+    cols_to_fix = ["child_keypoint_x", "child_keypoint_y", "child_keypoint_z", "yaw", "pitch"]
+    for col in cols_to_fix:
+        if col in df.columns:
+            # Force numeric conversion and interpolate
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = df[col].interpolate(method='linear', limit_direction='both')
+
+    # --- B. ENERGY CALCULATION ---
+    # Convert millimeters to meters
+    x_m = df["child_keypoint_x"] / 1000.0
+    y_m = df["child_keypoint_y"] / 1000.0
+    z_m = df["child_keypoint_z"] / 1000.0
+
+    # Fixed Time Step (dt) - Critical for valid physics calculation
+    dt = 1.0 / FPS
+
+    # Translational Energy
+    # Velocity (v) = dx / dt
+    vx = x_m.diff() / dt
+    vy = y_m.diff() / dt
+    vz = z_m.diff() / dt
+    v_sq = vx ** 2 + vy ** 2 + vz ** 2
+    e_trans = 0.5 * HEAD_MASS_KG * v_sq
+
+    # Rotational Energy
+    # Unwrap Yaw: Corrects jumps between -180 and +180 degrees
+    yaw_rad = df["yaw"]  # Assuming radians
+    d_yaw = np.arctan2(np.sin(yaw_rad.diff()), np.cos(yaw_rad.diff()))
+    d_pitch = df["pitch"].diff()
+
+    omega_sq = (d_yaw / dt) ** 2 + (d_pitch / dt) ** 2
+    e_rot = 0.5 * HEAD_INERTIA * omega_sq
+
+    # Total Energy
+    df['Energy_Total'] = (e_trans + e_rot).fillna(0)
+
+    # --- C. NOISE REMOVAL (SMOOTHING) ---
+    # Apply a moving average to smooth out sensor jitter
+    df['Energy_Total'] = df['Energy_Total'].rolling(window=3, center=True).mean().fillna(0)
+
+    return df
+
+
+print("Calculating Energy per Subject...")
+df_cones_all = df_cones_all.groupby('Subject', group_keys=False).apply(clean_and_calculate_energy)
+
+# Create a lookup dictionary for fast access: (Subject, Frame) -> Energy
+energy_map = df_cones_all.set_index(['Subject', 'Frame'])['Energy_Total'].to_dict()
+
+
+# ============================================================
+# 4. DYNAMIC RESPONSE ANALYSIS (Baseline Correction)
+# ============================================================
+def calculate_dynamic_energy_response(df_events, energy_map):
+    results = []
+
+    # Time Windows
+    pre_window_sec = 1.0
+    post_window_sec = 3.0
+
+    frames_pre = int(pre_window_sec * FPS)
+    frames_post = int(post_window_sec * FPS)
+
+    NOISE_THRESHOLD = 0.0001  # Ignore negligible energy changes
+
+    for subject, sub_df in df_events.groupby('Subject'):
+        sub_df = sub_df.sort_values('Frame')
+
+        for idx, row in sub_df.iterrows():
+            action = row['Azione']
+            start_frame = row['Frame']
+            admin = row['Admin']
+            group = row['Group']
+
+            # Filter for target social cues only
+            if action not in ['Coniglio', 'Indica']:
+                continue
+
+            # --- BASELINE (Pre-stimulus 1 sec) ---
+            baseline_vals = []
+            for f in range(start_frame - frames_pre, start_frame):
+                val = energy_map.get((subject, f))
+                if val is not None: baseline_vals.append(val)
+
+            if not baseline_vals: continue
+            baseline_energy = np.median(baseline_vals)  # Median is more robust to outliers
+
+            # --- RESPONSE (Post-stimulus 3 sec) ---
+            response_vals = []
+            response_frames = []
+            for f in range(start_frame, start_frame + frames_post):
+                val = energy_map.get((subject, f))
+                if val is not None:
+                    response_vals.append(val)
+                    response_frames.append(f)
+
+            if not response_vals: continue
+
+            response_vals = np.array(response_vals)
+
+            # --- METRICS ---
+            max_energy = np.max(response_vals)
+            # Delta Energy: How much effort was added on top of the resting state?
+            delta_energy = max_energy - baseline_energy
+
+            # Peak Latency: Time to reach maximum effort
+            idx_max = np.argmax(response_vals)
+            peak_latency = (response_frames[idx_max] - start_frame) / FPS
+
+            # Reactivity: Binary classification of response
+            # Criteria: >20% increase from baseline AND above noise threshold
+            has_responded = 1 if (delta_energy > baseline_energy * 0.20) and (delta_energy > NOISE_THRESHOLD) else 0
+
+            results.append({
+                'Subject': subject,
+                'Group': group,
+                'Admin': admin,
+                'Induction': action,
+                'Delta_Energy': delta_energy,
+                'Peak_Latency': peak_latency,
+                'Energy_Reactivity': has_responded
+            })
+
+    return pd.DataFrame(results)
+
+
+print("Calculating Dynamic Metrics...")
+df_results = calculate_dynamic_energy_response(df_vis_all, energy_map)
+
+# ============================================================
+# 5. STATISTICAL ANALYSIS & REPORTING
+# ============================================================
+# Aggregate per subject first to satisfy independence assumption
+subject_means = df_results.groupby(['Subject', 'Group', 'Admin']).agg({
+    'Delta_Energy': 'mean',
+    'Peak_Latency': 'mean',
+    'Energy_Reactivity': 'mean'
+}).reset_index()
+
+print("\n" + "=" * 40)
+print("STATISTICAL RESULTS (Mann-Whitney U)")
+print("=" * 40)
+
+
+def run_stat_test(df, metric, condition_name):
+    asd = df[df['Group'] == 'ASD'][metric].dropna()
+    td = df[df['Group'] == 'TD'][metric].dropna()
+
+    if len(asd) > 0 and len(td) > 0:
+        stat, p = mannwhitneyu(asd, td)
+        significance = "**SIGNIFICANT**" if p < 0.05 else "Not significant"
+        print(f"\nCondition: {condition_name} | Metric: {metric}")
+        print(f"  ASD Mean: {asd.mean():.4f} | TD Mean: {td.mean():.4f}")
+        print(f"  P-value : {p:.4f} -> {significance}")
+
+
+# Run tests for Robot and Therapist conditions separately
+for admin in ['Robot', 'Therapist']:
+    subset = subject_means[subject_means['Admin'] == admin]
+    run_stat_test(subset, 'Delta_Energy', admin)
+    run_stat_test(subset, 'Peak_Latency', admin)
+
+# ============================================================
+# 6. VISUALIZATION
+# ============================================================
+fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+# Plot 1: Intensity (Delta Energy)
+sns.boxplot(data=subject_means, x='Admin', y='Delta_Energy', hue='Group', ax=axes[0], palette="Set2", showfliers=False)
+axes[0].set_title("Effort Intensity (Delta Energy)")
+axes[0].set_ylabel("Joule (Max - Baseline)")
+
+# Plot 2: Speed (Latency)
+sns.boxplot(data=subject_means, x='Admin', y='Peak_Latency', hue='Group', ax=axes[1], palette="Set2", showfliers=False)
+axes[1].set_title("Response Speed (Peak Latency)")
+axes[1].set_ylabel("Seconds")
+
+plt.tight_layout()
+plt.show()
