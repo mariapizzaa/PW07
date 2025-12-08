@@ -1,216 +1,277 @@
-# ============================================================
-# Saccade-based Metric – Median Saccade Amplitude (per soggetto)
-# ============================================================
-# Questo script:
-#  - legge TD_cleaned.xlsx e ASD_cleaned.xlsx
-#  - per ogni soggetto calcola la mediana dell'ampiezza delle saccadi
-#  - salva le statistiche in un Excel
-#  - esegue un Mann–Whitney TD vs ASD
-#  - genera un boxplot TD vs ASD con i puntini e il p-value
-# ============================================================
-
-import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import mannwhitneyu
+import os
+import sys
 
-# ------------------------------------------------------------
-# 1. PATH DEI FILE
-# ------------------------------------------------------------
+# ==============================================================================
+# CONFIGURAZIONE
+# ==============================================================================
 
-# Cartella in cui si trova questo script
-base_dir = os.path.dirname(os.path.abspath(__file__))
+ASSUMED_FPS = 9.0  # FPS stimato dai dati
 
-# Percorsi ai file
-path_TD_clean = os.path.join(base_dir, "TD_cleaned.xlsx")
-path_ASD_clean = os.path.join(base_dir, "ASD_cleaned.xlsx")
+# Soglia equivalente a 30 deg/s in radianti/s ≈ 0.524
+VEL_THRESHOLD_DEG = 30.0
+VELOCITY_THRESHOLD = np.deg2rad(VEL_THRESHOLD_DEG)
 
-# Parametri per rilevare le saccadi
-SACCADE_VEL_THRESHOLD = 1.0   # soglia velocità angolare (rad/s)
-MIN_DT = 1e-6                 # per evitare divisioni per zero
-
-
-# ------------------------------------------------------------
-# 2. METRICA PER UN SINGOLO SOGGETTO
-# ------------------------------------------------------------
-def compute_saccade_median_amplitude(df_subject):
-    """
-    Calcola la mediana dell'ampiezza delle saccadi per UN soggetto.
-
-    - Usa yaw, pitch e timestamp
-    - Stima velocità angolare tra frame consecutivi
-    - Considera "saccadi" i frame con velocità > soglia
-    - Restituisce la mediana delle ampiezze (in rad)
-    """
-
-    df = df_subject.copy()
-
-    # Controllo che le colonne minime esistano
-    for col in ["timestamp", "yaw", "pitch"]:
-        if col not in df.columns:
-            return np.nan
-
-    # Ordino per timestamp
-    df = df.sort_values("timestamp")
-
-    # Converto le colonne in array numpy
-    yaw = df["yaw"].astype(float).to_numpy()
-    pitch = df["pitch"].astype(float).to_numpy()
-    t = df["timestamp"].astype(float).to_numpy()
-
-    # Differenze temporali tra frame consecutivi
-    dt = np.diff(t)
-    # Evito dt non validi o nulli
-    dt[dt <= MIN_DT] = np.nan
-
-    # Differenze angolari tra frame consecutivi
-    dyaw = np.diff(yaw)
-    dpitch = np.diff(pitch)
-
-    # Ampiezza angolare tra 2 frame (in rad)
-    amplitudes = np.sqrt(dyaw**2 + dpitch**2)
-
-    # Velocità angolare (rad/s)
-    angular_vel = amplitudes / dt
-
-    # Maschera di validità (dt valido) e soglia di velocità
-    valid = ~np.isnan(dt)
-    is_saccade = (angular_vel > SACCADE_VEL_THRESHOLD) & valid
-
-    # Se non ci sono saccadi, ritorno NaN
-    if not np.any(is_saccade):
-        return np.nan
-
-    # Ampiezze delle sole saccadi
-    saccade_amplitudes = amplitudes[is_saccade]
-
-    # Mediana dell'ampiezza delle saccadi
-    median_amp = np.median(saccade_amplitudes)
-
-    return median_amp
+COL_MAP = {
+    "yaw": "yaw",
+    "pitch": "pitch",
+    "timestamp": "timestamp",
+    "frame_cutted": "frame_cutted",
+    "id_soggetto": "id_soggetto"
+}
 
 
-# ------------------------------------------------------------
-# 3. PROCESSA UN INTERO GRUPPO (TD / ASD)
-# ------------------------------------------------------------
-def process_group_dataset(file_path, group_label):
-    """
-    Per un gruppo (TD o ASD):
-      - carica il file Excel
-      - divide i dati per id_soggetto
-      - calcola Saccade_Median_Amplitude per ogni soggetto
-      - restituisce un DataFrame riassuntivo
-    """
+# ==============================================================================
+# 1. FUNZIONI DI UTILITÀ
+# ==============================================================================
 
-    # Controllo che il file esista
-    if not os.path.exists(file_path):
-        print(f"ERRORE: file non trovato: {file_path}")
-        return None
+def reconstruct_time_axis(df, fps):
+    frame_indices = np.arange(len(df))
+    timestamps_ms = frame_indices * (1000.0 / fps)
+    return timestamps_ms
 
-    print(f"\nCaricamento dati gruppo {group_label} ...")
-    df_all = pd.read_excel(file_path)
 
-    summary = []
+def gaze_angles_to_cartesian(df):
+    yaw = df[COL_MAP["yaw"]].astype(float)
+    pitch = df[COL_MAP["pitch"]].astype(float)
 
-    # Tutti gli ID soggetto presenti nel file
-    subjects = df_all["id_soggetto"].unique()
-    print(f"Trovati {len(subjects)} soggetti nel gruppo {group_label}.")
+    x = np.cos(pitch) * np.sin(yaw)
+    y = np.sin(pitch)
+    z = np.cos(pitch) * np.cos(yaw)
 
-    # Loop sui soggetti
-    for subj in subjects:
-        # Righe di quel soggetto
-        df_subj = df_all[df_all["id_soggetto"] == subj]
+    return pd.DataFrame({"x": x, "y": y, "z": z}, index=df.index)
 
-        # Calcolo della metrica
-        median_amp = compute_saccade_median_amplitude(df_subj)
 
-        # Aggiungo ai risultati
-        summary.append({
-            "Subject_ID": subj,
-            "Group": group_label,
-            "Saccade_Median_Amplitude": median_amp
+def calculate_velocity_3d_cartesian(df, fps):
+    coords = gaze_angles_to_cartesian(df)
+
+    dx = coords["x"].diff()
+    dy = coords["y"].diff()
+    dz = coords["z"].diff()
+
+    dist = np.sqrt(dx**2 + dy**2 + dz**2)
+    velocity = dist / (1.0 / fps)
+
+    # Correggo tagli video
+    if COL_MAP["frame_cutted"] in df.columns:
+        cut_diff = df[COL_MAP["frame_cutted"]].diff()
+        mask = (cut_diff > 1) | (cut_diff < 0)
+        velocity[mask] = np.nan
+
+    return velocity, coords
+
+
+# ==============================================================================
+# 2. RILEVAMENTO MOVIMENTI OCULARI (I-VT)
+# ==============================================================================
+
+def detect_eye_movements_ivt(velocity_series, time_series_ms, coords,
+                             velocity_threshold=VELOCITY_THRESHOLD):
+
+    is_move = (velocity_series > velocity_threshold).fillna(False)
+
+    change = np.diff(is_move.astype(int))
+    starts = np.where(change == 1)[0] + 1
+    ends = np.where(change == -1)[0] + 1
+
+    if is_move.iloc[0]:
+        starts = np.insert(starts, 0, 0)
+
+    if is_move.iloc[-1]:
+        ends = np.append(ends, len(is_move) - 1)
+
+    if len(starts) > len(ends):
+        starts = starts[:len(ends)]
+    elif len(ends) > len(starts):
+        ends = ends[:len(starts)]
+
+    events = []
+    for s, e in zip(starts, ends):
+
+        vel_seg = velocity_series.iloc[s:e+1]
+        if len(vel_seg) < 1:
+            continue
+
+        t_start = time_series_ms.iloc[s]
+        t_end = time_series_ms.iloc[e]
+        duration = t_end - t_start  # ms
+
+        peak_vel = vel_seg.max()
+        mean_vel = vel_seg.mean()
+
+        # Ampiezza = distanza tra inizio e fine
+        idx_s = velocity_series.index[s]
+        idx_e = velocity_series.index[e]
+        p_start = coords.loc[idx_s]
+        p_end = coords.loc[idx_e]
+        amplitude = np.sqrt(((p_end - p_start)**2).sum())
+
+        events.append({
+            "duration_ms": duration,
+            "peak_velocity": peak_vel,
+            "mean_velocity": mean_vel,
+            "amplitude_cartesian": amplitude
         })
 
-    # Converto la lista in DataFrame
-    return pd.DataFrame(summary)
+    return pd.DataFrame(events)
 
 
-# ------------------------------------------------------------
-# 4. ESECUZIONE
-# ------------------------------------------------------------
+# ==============================================================================
+# 3. ELABORAZIONE PER SOGGETTO
+# ==============================================================================
 
-df_TD = process_group_dataset(path_TD_clean, "TD")
-df_ASD = process_group_dataset(path_ASD_clean, "ASD")
+def process_dataframe(df, group_label):
 
-if df_TD is not None and df_ASD is not None:
+    print(f"\n--- Elaborazione gruppo {group_label} ---")
 
-    # Unisco TD e ASD
-    final_stats_dataset = pd.concat([df_TD, df_ASD], ignore_index=True)
+    df.columns = [c.strip() for c in df.columns]
+    subjects = df[COL_MAP["id_soggetto"]].unique()
 
-    # Salvo l'Excel riassuntivo
-    out_path = os.path.join(base_dir, "Final_Saccade_Statistics.xlsx")
-    final_stats_dataset.to_excel(out_path, index=False)
+    summary_list = []
+    raw_list = []
 
-    print("\n==============================================")
-    print("PROCESSO SACCADE-BASED COMPLETATO")
-    print("==============================================")
-    print(f"File salvato in: {out_path}")
-    print("\nAnteprima:")
-    print(final_stats_dataset.head())
+    for subj in subjects:
 
-    # ------------------ STATISTICA ------------------------
-    # Valori per TD e ASD
-    td_vals = final_stats_dataset[
-        final_stats_dataset["Group"] == "TD"
-    ]["Saccade_Median_Amplitude"].dropna().tolist()
+        df_sub = df[df[COL_MAP["id_soggetto"]] == subj].copy()
+        df_sub["timestamp_ms"] = reconstruct_time_axis(df_sub, ASSUMED_FPS)
 
-    asd_vals = final_stats_dataset[
-        final_stats_dataset["Group"] == "ASD"
-    ]["Saccade_Median_Amplitude"].dropna().tolist()
+        vel, coords = calculate_velocity_3d_cartesian(df_sub, ASSUMED_FPS)
 
-    # Test di Mann–Whitney
-    u_stat, p_val = mannwhitneyu(td_vals, asd_vals, alternative="two-sided")
-    print(f"\nMann–Whitney (Saccade_Median_Amplitude): U = {u_stat:.3f}, p = {p_val:.4f}")
+        events = detect_eye_movements_ivt(
+            vel, df_sub["timestamp_ms"], coords,
+            velocity_threshold=VELOCITY_THRESHOLD
+        )
 
-    # ------------------ BOXPLOT ---------------------------
-    plt.figure(figsize=(6, 5))
+        if events.empty:
+            continue
 
-    bp = plt.boxplot(
+        events["subject_id"] = subj
+        events["group"] = group_label
+        raw_list.append(events)
+
+        total_time = (df_sub["timestamp_ms"].iloc[-1] -
+                      df_sub["timestamp_ms"].iloc[0]) / 1000.0
+
+        freq = len(events) / total_time if total_time > 0 else 0
+
+        summary_list.append({
+            "Subject": subj,
+            "Group": group_label,
+            "EyeMovement_Frequency_Hz": freq,
+            "Mean_Duration_ms": events["duration_ms"].mean(),
+            "Mean_Peak_Velocity": events["peak_velocity"].mean(),
+            "Mean_Amplitude_Cartesian": events["amplitude_cartesian"].mean()
+        })
+
+    if not summary_list:
+        return pd.DataFrame(), pd.DataFrame()
+
+    return pd.DataFrame(summary_list), pd.concat(raw_list, ignore_index=True)
+
+
+# ==============================================================================
+# 4. MAIN: CARICA FILE + ANALISI + GRAFICI
+# ==============================================================================
+
+base_dir = os.path.dirname(os.path.abspath(__file__))
+path_TD = os.path.join(base_dir, "TD_cleaned.xlsx")
+path_ASD = os.path.join(base_dir, "ASD_cleaned.xlsx")
+
+if not os.path.exists(path_TD) or not os.path.exists(path_ASD):
+    print("ERRORE: File Excel non trovati!")
+    print("path_TD:", path_TD, os.path.exists(path_TD))
+    print("path_ASD:", path_ASD, os.path.exists(path_ASD))
+    sys.exit()
+
+print("\nCaricamento file...")
+df_TD = pd.read_excel(path_TD)
+df_ASD = pd.read_excel(path_ASD)
+
+summary_td, raw_td = process_dataframe(df_TD, "TD")
+summary_asd, raw_asd = process_dataframe(df_ASD, "ASD")
+
+if summary_td.empty or summary_asd.empty:
+    print("\nERRORE: Dati insufficienti per creare grafici o statistiche.")
+    sys.exit()
+
+full_summary = pd.concat([summary_td, summary_asd], ignore_index=True)
+
+out_path = os.path.join(base_dir, "EyeMovement_Results.xlsx")
+full_summary.to_excel(out_path, index=False)
+print(f"\nRisultati salvati in: {out_path}")
+
+# ------------------------------------------------------------------------------
+# BOX PLOT + TEST STATISTICO
+# ------------------------------------------------------------------------------
+
+metrics = [
+    ("EyeMovement_Frequency_Hz", "Eye movement frequency (Hz)"),
+    ("Mean_Duration_ms", "Mean duration (ms)"),
+    ("Mean_Peak_Velocity", "Mean peak velocity (unit/s)"),
+    ("Mean_Amplitude_Cartesian", "Mean amplitude (3D distance)")
+]
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+axes = axes.flatten()
+
+print("\n--- TEST STATISTICO MANN–WHITNEY (TD vs ASD) ---")
+
+for i, (col, title) in enumerate(metrics):
+    ax = axes[i]
+
+    td_vals = summary_td[col].dropna()
+    asd_vals = summary_asd[col].dropna()
+
+    # Boxplot con colori
+    bp = ax.boxplot(
         [td_vals, asd_vals],
-        positions=[1, 2],
-        tick_labels=["TD", "ASD"],
-        patch_artist=True
+        labels=["TD", "ASD"],
+        patch_artist=True,
+        widths=0.6
     )
 
-    # Colori delle box
-    colors = ["#4c72b0", "#dd8452"]
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.4)
+    colors = ["#6BAED6", "#FD8D3C"]  # azzurrino, arancio
+    for patch, c in zip(bp["boxes"], colors):
+        patch.set_facecolor(c)
 
-    # Puntini con jitter
-    jitter = 0.06
-    for i, vals in enumerate([td_vals, asd_vals], start=1):
-        x = np.random.normal(loc=i, scale=jitter, size=len(vals))
-        plt.scatter(x, vals, color="black", s=25, zorder=3)
+    # Punti singoli con jitter
+    x_td = np.random.normal(1, 0.04, size=len(td_vals))
+    x_asd = np.random.normal(2, 0.04, size=len(asd_vals))
+    ax.scatter(x_td, td_vals, s=12, alpha=0.6, color="#2171B5")
+    ax.scatter(x_asd, asd_vals, s=12, alpha=0.6, color="#D94801")
 
-    # p-value sopra le box
-    y_max = max(max(td_vals), max(asd_vals))
-    if y_max <= 0:
-        y_max = 1.0
-    y_line = y_max + 0.05 * y_max
+    # Test Mann–Whitney
+    if len(td_vals) > 0 and len(asd_vals) > 0:
+        u, p = mannwhitneyu(td_vals, asd_vals)
+        print(f"{col}: p = {p:.4f}")
 
-    plt.plot([1, 2], [y_line, y_line], color="black")
-    plt.text(1.5, y_line + 0.02 * y_max,
-             f"p = {p_val:.4f}", ha="center")
+        # Barra e asterisco se significativo
+        y_max = max(td_vals.max(), asd_vals.max())
+        h = (y_max * 0.05) if y_max != 0 else 0.1
+        ax.set_title(title)
 
-    # Titoli e assi
-    plt.title("Saccade Median Amplitude per Soggetto")
-    plt.ylabel("Amplitude (rad)")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
+        if p < 0.05:
+            ax.plot([1, 1, 2, 2],
+                    [y_max + h, y_max + 2*h, y_max + 2*h, y_max + h],
+                    lw=1.5, c="k")
+            ax.text(1.5, y_max + 2.6*h,
+                    f"p={p:.3f} *",
+                    ha="center", va="bottom", fontsize=9, color="red")
+        else:
+            ax.text(1.5, y_max + 1.8*h,
+                    f"p={p:.3f}",
+                    ha="center", va="bottom", fontsize=9, color="black")
 
-else:
-    print("\nERRORE: impossibile completare il processo (file mancanti).")
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+plt.tight_layout()
+
+# Salva figura per le slide
+fig_path = os.path.join(base_dir, "EyeMovement_Boxplots.png")
+plt.savefig(fig_path, dpi=300)
+print(f"\nFigura boxplot salvata in: {fig_path}")
+
+plt.show()
