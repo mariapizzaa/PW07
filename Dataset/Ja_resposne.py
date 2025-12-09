@@ -1,282 +1,430 @@
-import pandas as pd
+# Ja_response.py
+# ==========================================
+# Joint Attention (JA) Response Rate & Latency
+# Implementazione ispirata ad Anzalone et al.
+# ==========================================
+
+import os
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+from scipy.signal import butter, filtfilt
 from scipy.stats import mannwhitneyu
-import os
+from sklearn.cluster import DBSCAN
 
 # ============================================================
-# 1. CONSTANTS FOR HEAD ENERGY (From your snippet)
+# 1. PHYSICAL CONSTANTS
 # ============================================================
 TOTAL_MASS_KG = 25.0
 HEAD_MASS_KG = TOTAL_MASS_KG * 0.0668
 HEAD_RADIUS_M = 0.0835
 HEAD_INERTIA = 0.4 * HEAD_MASS_KG * (HEAD_RADIUS_M ** 2)
 
+FPS = 9.0  # frame rate (Hz) dai dati
+
+# Filtro per movimenti lenti (Anzalone: < ~1 Hz)
+CUTOFF_HZ = 1.0
+
+# DBSCAN: parametri per cluster temporali (secondi)
+DBSCAN_EPS_SEC = 0.6      # punti entro 0.6 s fusi nello stesso gesto
+DBSCAN_MIN_SAMPLES = 3    # minimo #frame sopra soglia per chiamarlo gesto
+
+# Finestra di risposta alla JA (secondi)
+RESPONSE_WINDOW_SEC = 4.0
+
+# Percentile per threshold energetico (robusto)
+ENERGY_PERCENTILE = 75.0
+
 # ============================================================
-# 2. SETUP PATHS & LOAD DATA
+# 2. DATA LOADING
 # ============================================================
+# --- PATH (ADATTA A PARTIRE DALLA TUA CARTELLA PROGETTO) ---
+
+# cartella dove si trova questo script Ja_resposne.py
 base_dir = os.path.dirname(os.path.abspath(__file__))
+
+# sottocartella con i dataset (come usavi negli altri script)
 DATA_DIR = os.path.join(base_dir, "dataset iniziali e risultati")
 
-# File Paths
-file_cones_asd = os.path.join(DATA_DIR, "ASD_cleaned_advanced.xlsx")
-file_cones_td = os.path.join(DATA_DIR, "TD_cleaned_advanced.xlsx")
-file_vis_asd = os.path.join(DATA_DIR, "Visual_Analysis_ASD_after.xlsx")
-file_vis_td = os.path.join(DATA_DIR, "Visual_Analysis_TD_after.xlsx")
-
+# Nomi file effettivi (versione _advanced / _after)
+path_cones_asd = os.path.join(DATA_DIR, "ASD_cleaned_advanced.xlsx")
+path_cones_td = os.path.join(DATA_DIR, "TD_cleaned_advanced.xlsx")
+path_vis_asd  = os.path.join(DATA_DIR, "Visual_Analysis_ASD_after.xlsx")
+path_vis_td   = os.path.join(DATA_DIR, "Visual_Analysis_TD_after.xlsx")
 
 def load_data(filepath):
+    print(f"Caricamento: {filepath}")
     try:
-        if filepath.endswith('.xlsx'):
+        if filepath.endswith(".csv"):
+            return pd.read_csv(filepath)
+        elif filepath.endswith(".xlsx"):
             return pd.read_excel(filepath)
-        return pd.read_csv(filepath, encoding='ISO-8859-1', sep=None, engine='python')
+        else:
+            print(f"Formato non supportato: {filepath}")
+            return pd.DataFrame()
     except Exception as e:
-        print(f"Error loading {filepath}: {e}")
+        print(f"Errore nel caricamento di {filepath}: {e}")
         return pd.DataFrame()
 
 
-print("Caricamento dati...")
-df_vis_asd = load_data(file_vis_asd)
-df_vis_td = load_data(file_vis_td)
-df_cones_asd = load_data(file_cones_asd)
-df_cones_td = load_data(file_cones_td)
+# Pose/gaze (head kinematics)
+df_cones_asd = load_data(path_cones_asd)
+df_cones_td = load_data(path_cones_td)
 
-# Label Groups
-df_vis_asd['Group'] = 'ASD'
-df_vis_td['Group'] = 'TD'
-df_cones_asd['Group'] = 'ASD'
-df_cones_td['Group'] = 'TD'
+# Eventi (JA inductions: Coniglio / Indica)
+df_vis_asd = load_data(path_vis_asd)
+df_vis_td = load_data(path_vis_td)
 
-# Concat
-df_vis_all = pd.concat([df_vis_asd, df_vis_td], ignore_index=True)
+# Etichetta gruppi
+df_cones_asd["Group"] = "ASD"
+df_cones_td["Group"] = "TD"
+df_vis_asd["Group"]  = "ASD"
+df_vis_td["Group"]   = "TD"
+
+# Merge
 df_cones_all = pd.concat([df_cones_asd, df_cones_td], ignore_index=True)
+df_vis_all   = pd.concat([df_vis_asd, df_vis_td], ignore_index=True)
 
-# Standardize Columns
-df_cones_all.rename(columns={'id_soggetto': 'Subject', 'frame': 'Frame', 'timestamp': 'Timestamp'}, inplace=True)
-df_cones_all['Timestamp'] = pd.to_numeric(df_cones_all['Timestamp'], errors='coerce')
+# Uniforma nomi colonne
+df_cones_all.rename(
+    columns={
+        "id_soggetto": "Subject",
+        "frame": "Frame",
+        "timestamp": "Timestamp",
+    },
+    inplace=True,
+)
+
+df_vis_all.rename(
+    columns={
+        "id_soggetto": "Subject",
+        "frame": "Frame",
+    },
+    inplace=True,
+)
+
+# ============================================================
+# 3. LOW-PASS FILTER (Butterworth)
+# ============================================================
+
+def butter_lowpass(cutoff_hz, fs, order=4):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff_hz / nyq
+    b, a = butter(order, normal_cutoff, btype="low", analog=False)
+    return b, a
+
+
+def apply_lowpass(signal, cutoff_hz, fs):
+    """
+    Applica filtro low-pass a 1 Hz (default) sull'array 1D 'signal'.
+    Usa filtfilt per non introdurre sfasamento.
+    """
+    b, a = butter_lowpass(cutoff_hz, fs, order=4)
+    # Gestione edge case: tutti NaN o costante
+    sig = np.asarray(signal, dtype=float)
+    if np.all(np.isnan(sig)):
+        return np.zeros_like(sig)
+    # Sostituisci NaN con interpolazione semplice
+    nans = np.isnan(sig)
+    if np.any(nans):
+        idx = np.arange(len(sig))
+        sig[nans] = np.interp(idx[nans], idx[~nans], sig[~nans])
+    return filtfilt(b, a, sig)
 
 
 # ============================================================
-# 3. IMPLEMENTAZIONE CALCOLO ENERGIA (Tuoi algoritmi)
+# 4. HEAD ENERGY PER SUBJECT
 # ============================================================
-def add_instantaneous_energy(df):
+
+def compute_head_energy_for_subject(df_subject):
     """
-    Adds 'Energy_Total' column to the dataframe using Anzalone's physics constants.
-    Calculates instantaneous energy per frame.
+    Per un singolo soggetto:
+      1. Ordina per frame
+      2. Interpola missing per child_keypoint_x/y/z, yaw, pitch
+      3. Converte posizioni in m
+      4. Calcola velocità traslazionale e energia cinetica
+      5. Unwrap yaw/pitch, calcola velocità angolari e energia rotazionale
+      6. Somma: Energy_Total
     """
-    # Sort just in case
-    df = df.sort_values("Timestamp")
+    df = df_subject.sort_values("Frame").reset_index(drop=True).copy()
 
-    # --- A. PREPARE DATA ---
-    # Convert from mm to meters
-    x_m = df["child_keypoint_x"].astype(float) / 1000.0
-    y_m = df["child_keypoint_y"].astype(float) / 1000.0
-    z_m = df["child_keypoint_z"].astype(float) / 1000.0
+    cols_to_fix = ["child_keypoint_x", "child_keypoint_y", "child_keypoint_z",
+                   "yaw", "pitch"]
+    for col in cols_to_fix:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = df[col].interpolate(method="linear", limit_direction="both")
 
-    # Yaw/Pitch
-    yaw = df["yaw"].astype(float)
-    pitch = df["pitch"].astype(float)
+    # Posizioni in metri (erano mm)
+    x_m = df["child_keypoint_x"] / 1000.0
+    y_m = df["child_keypoint_y"] / 1000.0
+    z_m = df["child_keypoint_z"] / 1000.0
 
-    # Time difference
-    dt = df["Timestamp"].diff().astype(float)
-    # Filter invalid time steps (jumps > 10s or <= 0)
-    valid_mask = (dt > 0) & (dt < 10.0)
+    dt = 1.0 / FPS
 
-    # --- B. TRANSLATIONAL ENERGY ---
-    dx = x_m.diff()
-    dy = y_m.diff()
-    dz = z_m.diff()
-    dist_sq = dx ** 2 + dy ** 2 + dz ** 2
+    # Velocità traslazionale
+    vx = x_m.diff() / dt
+    vy = y_m.diff() / dt
+    vz = z_m.diff() / dt
+    v_sq = vx**2 + vy**2 + vz**2
+    e_trans = 0.5 * HEAD_MASS_KG * v_sq
 
-    # Default FPS fallback (1/9s) if dt is messy, but prefer real dt
-    DT_DEFAULT = 1.0 / 9.0
+    # Velocità angolare (yaw/pitch in radianti)
+    # np.unwrap elimina salti tipo -pi / +pi
+    yaw = np.unwrap(df["yaw"].to_numpy(dtype=float))
+    pitch = np.unwrap(df["pitch"].to_numpy(dtype=float))
 
-    vel_sq = dist_sq / (DT_DEFAULT ** 2)  # Init with default
-    vel_sq[valid_mask] = dist_sq[valid_mask] / (dt[valid_mask] ** 2)  # Update with real time
+    dyaw = np.diff(yaw, prepend=yaw[0]) / dt
+    dpitch = np.diff(pitch, prepend=pitch[0]) / dt
 
-    energy_trans = 0.5 * HEAD_MASS_KG * vel_sq
+    omega_sq = dyaw**2 + dpitch**2
+    e_rot = 0.5 * HEAD_INERTIA * omega_sq
 
-    # --- C. ROTATIONAL ENERGY ---
-    d_yaw = yaw.diff()
-    d_pitch = pitch.diff()
+    energy_total = (e_trans + e_rot).fillna(0.0)
 
-    # Unwrap yaw (handle -pi to pi jumps)
-    d_yaw = np.arctan2(np.sin(d_yaw), np.cos(d_yaw))
+    df["Energy_Total"] = energy_total
 
-    ang_dist_sq = d_yaw ** 2 + d_pitch ** 2
-
-    ang_vel_sq = ang_dist_sq / (DT_DEFAULT ** 2)
-    ang_vel_sq[valid_mask] = ang_dist_sq[valid_mask] / (dt[valid_mask] ** 2)
-
-    energy_rot = 0.5 * HEAD_INERTIA * ang_vel_sq
-
-    # --- D. TOTAL ENERGY ---
-    # Fill NA (first frame) with 0
-    df['Energy_Total'] = (energy_trans + energy_rot).fillna(0)
+    # Filtro low-pass sulla totale per isolare movimenti lenti (intenzionali)
+    df["Energy_LP"] = apply_lowpass(df["Energy_Total"].values, CUTOFF_HZ, FPS)
 
     return df
 
 
-print("Calcolo energie per ogni frame (questo potrebbe richiedere qualche secondo)...")
-# Apply calculation per subject
-df_cones_all = df_cones_all.groupby('Subject', group_keys=False).apply(add_instantaneous_energy)
-
-# Index map for fast lookup
-# We need to look up energy by (Subject, Frame)
-energy_map = df_cones_all.drop_duplicates(subset=['Subject', 'Frame']).set_index(['Subject', 'Frame'])[
-    'Energy_Total'].to_dict()
-# Soglia per soggetto: mean + 1 * std (puoi cambiare z se vuoi)
-z_threshold = 1.0
-
-threshold_map = (
-    df_cones_all
-    .groupby('Subject')['Energy_Total']
-    .agg(['mean', 'std'])
-    .dropna()
+print("Calcolo energia fisica della testa per ogni soggetto...")
+df_cones_all = df_cones_all.groupby("Subject", group_keys=False).apply(
+    compute_head_energy_for_subject
 )
-threshold_map['threshold'] = threshold_map['mean'] + z_threshold * threshold_map['std']
 
-# dict: Subject -> threshold
-subject_threshold = threshold_map['threshold'].to_dict()
+# ============================================================
+# 5. DETECTION: SLOW HEAD MOVEMENTS (DBSCAN)
+# ============================================================
 
-
-def calculate_dynamic_energy_response(df_events, energy_map, fps=9.0):
+def detect_slow_movements_subject(df_subject):
     """
-    Calcola la risposta energetica RELATIVA (Delta).
-    1. Baseline: 1 secondo PRIMA dello stimolo.
-    2. Response: 3 secondi DOPO lo stimolo.
-    3. Metrica: Max Energy nella finestra - Baseline.
-    4. Latenza: Tempo dal 'bip' al picco massimo di energia.
+    Implementa pipeline Anzalone:
+      - usa Energy_LP (low-pass <1Hz)
+      - soglia per frames "attivi"
+      - DBSCAN sui tempi (sec) dei frame attivi
+      - restituisce lista dei centri temporali (in secondi) dei cluster (gesti)
     """
-    results = []
+    df = df_subject.sort_values("Frame")
 
-    # Parametri finestra
-    pre_window_sec = 1.0  # Tempo prima per la baseline
-    post_window_sec = 3.0  # Tempo dopo per la risposta
+    energy = df["Energy_LP"].to_numpy(dtype=float)
 
-    frames_pre = int(pre_window_sec * fps)
-    frames_post = int(post_window_sec * fps)
+    # Escludi casi banali
+    if np.all(np.isclose(energy, energy[0])):
+        return []
 
-    for subject, sub_df in df_events.groupby('Subject'):
-        sub_df = sub_df.sort_values('Frame')
+    # Threshold robusto = percentile (es. 75°)
+    thr = np.nanpercentile(energy, ENERGY_PERCENTILE)
 
-        for idx, row in sub_df.iterrows():
-            action = row['Azione']
-            start_frame = row['Frame']
-            admin = row['Admin']
-            group = row['Group']
+    active = df.loc[energy >= thr, "Frame"].to_numpy(dtype=float)
 
-            if action in ['Coniglio', 'Indica']:
+    if active.size < DBSCAN_MIN_SAMPLES:
+        return []
 
-                # A. Estrai Baseline (1 sec prima)
-                baseline_vals = []
-                for f in range(start_frame - frames_pre, start_frame):
-                    val = energy_map.get((subject, f))
-                    if val is not None: baseline_vals.append(val)
+    # Converti in secondi
+    times_sec = active / FPS
+    X = times_sec.reshape(-1, 1)
 
-                # Se non abbiamo dati prima (es. inizio video), usiamo 0 o saltiamo
-                baseline_energy = np.median(baseline_vals) if len(baseline_vals) > 0 else 0.0
+    db = DBSCAN(
+        eps=DBSCAN_EPS_SEC,
+        min_samples=DBSCAN_MIN_SAMPLES,
+        metric="euclidean",
+    ).fit(X)
 
-                # B. Estrai Risposta (3 sec dopo)
-                response_vals = []
-                response_frames = []
-                for f in range(start_frame, start_frame + frames_post):
-                    val = energy_map.get((subject, f))
-                    if val is not None:
-                        response_vals.append(val)
-                        response_frames.append(f)
+    labels = db.labels_
+    unique_labels = sorted([lab for lab in set(labels) if lab != -1])
 
-                if len(response_vals) == 0:
-                    continue
+    centers_sec = []
+    for lab in unique_labels:
+        cluster_times = times_sec[labels == lab]
+        if cluster_times.size > 0:
+            centers_sec.append(cluster_times.mean())
 
-                response_vals = np.array(response_vals)
-
-                # --- METRICHE MIGLIORATE ---
-
-                # 1. Delta Energy (Picco massimo - Baseline)
-                # Indica l'intensità del movimento di reazione "pulita" dal rumore di fondo
-                max_energy = np.max(response_vals)
-                delta_energy = max_energy - baseline_energy
-
-                # 2. Peak Latency (Tempo per raggiungere il massimo sforzo)
-                # Molto più robusto della soglia: ci dice QUANDO ha fatto il movimento principale
-                idx_max = np.argmax(response_vals)
-                frame_max = response_frames[idx_max]
-                peak_latency = (frame_max - start_frame) / fps
-
-                # 3. Reactivity (Rate): Consideriamo "Risposta" se il picco è almeno il 20% superiore alla baseline
-                # Questo evita di contare il rumore come risposta
-                has_responded = 1 if delta_energy > (baseline_energy * 0.20) else 0
-
-                results.append({
-                    'Subject': subject,
-                    'Group': group,
-                    'Admin': admin,
-                    'Induction_Type': action,
-                    'Delta_Energy': delta_energy,  # Intensità Reazione
-                    'Peak_Latency': peak_latency,  # Velocità Reazione
-                    'Energy_Reactivity': has_responded  # Rate (basato su incremento)
-                })
-
-    return pd.DataFrame(results)
+    centers_sec = sorted(centers_sec)
+    return centers_sec
 
 
-print("Calcolo metriche dinamiche (Baseline Correction)...")
-df_dynamic_res = calculate_dynamic_energy_response(df_vis_all, energy_map)
+print("Rilevamento movimenti lenti della testa (analisi spettrale + soglia + DBSCAN)...")
+
+# Dizionario: Subject -> [tempi_sec dei centri cluster]
+movement_events = {}
+for subj, df_sub in df_cones_all.groupby("Subject"):
+    centers = detect_slow_movements_subject(df_sub)
+    movement_events[subj] = centers
 
 # ============================================================
-# 5. STATISTICA SUI NUOVI DATI
+# 6. MATCHING: JA INDUCTIONS -> HEAD MOVEMENT EVENTS
 # ============================================================
 
-subject_metrics_dyn = df_dynamic_res.groupby(['Subject', 'Group', 'Admin']).agg(
-    Avg_Delta_Energy=('Delta_Energy', 'mean'),
-    Avg_Peak_Latency=('Peak_Latency', 'mean'),
-    Reactivity_Rate=('Energy_Reactivity', 'mean')
-).reset_index()
+def compute_ja_trials(df_events, movement_events):
+    """
+    Per ogni evento di JA induction (Coniglio / Indica):
+      - trova il cluster di movimento lento più vicino
+        nel range (stim_time, stim_time + RESPONSE_WINDOW_SEC]
+      - se trovato: Responded=1, Latency = t_cluster - t_stim
+      - altrimenti: Responded=0, Latency = NaN
+    """
+    rows = []
 
-print("\n=== ANALISI STATISTICA (BASELINE CORRECTED) ===")
+    for idx, row in df_events.iterrows():
+        action = row.get("Azione", None)
+        if action not in ["Coniglio", "Indica"]:
+            continue
+
+        subj = row["Subject"]
+        frame = row["Frame"]
+        admin = row.get("Admin", None)
+        group = row.get("Group", None)
+
+        stim_time = frame / FPS
+        centers = movement_events.get(subj, [])
+
+        # Cerca centri successivi allo stimolo entro la finestra di 4s
+        candidate_times = [
+            t for t in centers if (t > stim_time) and (t <= stim_time + RESPONSE_WINDOW_SEC)
+        ]
+
+        if len(candidate_times) > 0:
+            # centro più vicino temporalmente allo stimolo
+            chosen = min(candidate_times, key=lambda t: abs(t - stim_time))
+            responded = 1
+            latency = chosen - stim_time
+        else:
+            responded = 0
+            latency = np.nan
+
+        rows.append(
+            {
+                "Subject": subj,
+                "Group": group,
+                "Admin": admin,
+                "Induction": action,
+                "Stim_Frame": frame,
+                "Stim_Time": stim_time,
+                "Responded": responded,
+                "Latency": latency,  # in secondi
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
-def run_test(df, metric, admin):
-    asd = df[(df['Group'] == 'ASD') & (df['Admin'] == admin)][metric].dropna()
-    td = df[(df['Group'] == 'TD') & (df['Admin'] == admin)][metric].dropna()
-
-    if len(asd) == 0 or len(td) == 0: return
-
-    stat, p = mannwhitneyu(asd, td)
-    sig = "**SIGNIFICATIVO**" if p < 0.05 else "Non significativo"
-
-    print(f"\nCondition: {admin} | Metric: {metric}")
-    print(f"  > ASD: {asd.mean():.4f} | TD: {td.mean():.4f}")
-    print(f"  > P-value: {p:.4f} ({sig})")
-
-
-# Intensità della risposta (Sforzo netto)
-run_test(subject_metrics_dyn, 'Avg_Delta_Energy', 'Robot')
-run_test(subject_metrics_dyn, 'Avg_Delta_Energy', 'Therapist')
-
-# Velocità della risposta (Tempo al picco)
-run_test(subject_metrics_dyn, 'Avg_Peak_Latency', 'Robot')
-run_test(subject_metrics_dyn, 'Avg_Peak_Latency', 'Therapist')
-
-# Rateo di reazione (Quante volte incrementano l'energia)
-run_test(subject_metrics_dyn, 'Reactivity_Rate', 'Robot')
+print("Calcolo head movement response to JA induction (stile Anzalone adattato)...")
+df_ja_trials = compute_ja_trials(df_vis_all, movement_events)
 
 # ============================================================
-# 6. VISUALIZZAZIONE DELTA
+# 7. METRICHE: RESPONSE RATE & LATENCY
 # ============================================================
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-# Plot 1: Intensità (Delta Energy)
-sns.boxplot(x='Admin', y='Avg_Delta_Energy', hue='Group', data=subject_metrics_dyn, ax=axes[0], palette="Set2")
-axes[0].set_title('Intensity of Response (Delta Energy)')
-axes[0].set_ylabel('Joule (Max - Baseline)')
+def compute_subject_level_metrics(df_ja_trials):
+    """
+    Aggrega a livello di soggetto:
+      - Response_Rate: % stimoli con Responded=1
+      - Mean_Latency: media Latency solo sulle risposte presenti
+    """
+    # mean sulla colonna boolean/binary = rate
+    agg_rows = []
 
-# Plot 2: Latenza (Peak Latency)
-sns.boxplot(x='Admin', y='Avg_Peak_Latency', hue='Group', data=subject_metrics_dyn, ax=axes[1], palette="Set2")
-axes[1].set_title('Speed of Response (Peak Latency)')
-axes[1].set_ylabel('Seconds to Max Energy')
+    for (subj, group, admin), sub_df in df_ja_trials.groupby(
+        ["Subject", "Group", "Admin"]
+    ):
+        n_stim = len(sub_df)
+        if n_stim == 0:
+            continue
 
-plt.tight_layout()
-plt.show()
+        resp_rate = sub_df["Responded"].mean()
+
+        latencies = sub_df.loc[sub_df["Responded"] == 1, "Latency"]
+        mean_lat = latencies.mean() if len(latencies) > 0 else np.nan
+
+        agg_rows.append(
+            {
+                "Subject": subj,
+                "Group": group,
+                "Admin": admin,
+                "N_Stimuli": n_stim,
+                "Response_Rate": resp_rate,
+                "Mean_Latency": mean_lat,
+            }
+        )
+
+    return pd.DataFrame(agg_rows)
+
+
+df_subject_metrics = compute_subject_level_metrics(df_ja_trials)
+
+# ============================================================
+# 8. STATISTICHE (ASD vs TD) PER ADMIN (ROBOT / THERAPIST)
+# ============================================================
+
+def run_mannwhitney_for_metric(df, metric, admin_label):
+    asd = df[(df["Group"] == "ASD") & (df["Admin"] == admin_label)][metric].dropna()
+    td = df[(df["Group"] == "TD") & (df["Admin"] == admin_label)][metric].dropna()
+
+    if len(asd) < 2 or len(td) < 2:
+        print(f"[ATTENZIONE] Dati insufficienti per test {metric} | {admin_label}")
+        return
+
+    stat, p = mannwhitneyu(asd, td, alternative="two-sided")
+    signif = "SIGNIFICATIVO" if p < 0.05 else "non significativo"
+
+    print(f"\nCondition: {admin_label} | Metric: {metric}")
+    print(f"  ASD: {asd.mean():.3f} | TD: {td.mean():.3f}")
+    print(f"  p-value: {p:.4f} -> {signif}")
+
+
+print("\n=== HEAD MOVEMENT RESPONSE TO JA INDUCTION (ROBOT/THERAPIST) ===")
+for admin_label in sorted(df_subject_metrics["Admin"].dropna().unique()):
+    run_mannwhitney_for_metric(df_subject_metrics, "Response_Rate", admin_label)
+    run_mannwhitney_for_metric(df_subject_metrics, "Mean_Latency", admin_label)
+
+# ============================================================
+# 9. VISUALIZZAZIONE (OPZIONALE)
+# ============================================================
+
+if not df_subject_metrics.empty:
+    plt.figure(figsize=(10, 4))
+
+    plt.subplot(1, 2, 1)
+    sns.boxplot(
+        data=df_subject_metrics,
+        x="Admin",
+        y="Response_Rate",
+        hue="Group",
+        showfliers=False,
+    )
+    plt.title("JA Response Rate")
+    plt.ylabel("Response Rate (0-1)")
+    plt.xlabel("Admin")
+
+    plt.subplot(1, 2, 2)
+    sns.boxplot(
+        data=df_subject_metrics,
+        x="Admin",
+        y="Mean_Latency",
+        hue="Group",
+        showfliers=False,
+    )
+    plt.title("JA Latency (solo risposte)")
+    plt.ylabel("Latency [s]")
+    plt.xlabel("Admin")
+
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# 10. SALVATAGGIO RISULTATI (FACOLTATIVO)
+# ============================================================
+
+out_dir = os.path.join(base_dir, "results_JA")
+os.makedirs(out_dir, exist_ok=True)
+
+df_ja_trials.to_excel(os.path.join(out_dir, "JA_trials_detail.xlsx"), index=False)
+df_subject_metrics.to_excel(os.path.join(out_dir, "JA_subject_metrics.xlsx"), index=False)
+
+print("\nRisultati salvati in:", out_dir)
+print("Script terminato.")
