@@ -7,14 +7,14 @@ from scipy.stats import mannwhitneyu
 from sklearn.cluster import DBSCAN
 import os
 
-# 1. PARAMETRI E COSTANTI
+# 1. PHYSICAL CONSTANTS (as in Anzalone)
 TOTAL_MASS_KG = 25.0
 HEAD_MASS_KG = TOTAL_MASS_KG * 0.0668
 HEAD_RADIUS_M = 0.0835
 HEAD_INERTIA = 0.4 * HEAD_MASS_KG * (HEAD_RADIUS_M ** 2)
 
 FPS = 9.0
-CUTOFF_HZ = 1.0  # Soglia per di 1Hz movimento lento
+CUTOFF_HZ = 1.0  # 1Hz for slow movm.
 
 # DBSCAN
 DBSCAN_EPS_SEC = 0.6
@@ -24,11 +24,11 @@ DBSCAN_MIN_SAMPLES = 3
 RESPONSE_WINDOW_SEC = 4.0
 
 # Soglie per il gaze
-YAW_THRESHOLD_RAD = 0.2   # ~11 gradi. Se maggiore sta guardando di lato.
-PITCH_LIMIT_LOW = -1.0    # Pitch se guarda i piedi
-PITCH_LIMIT_HIGH = 0.5    # Pitch se guarda il soffitto
+YAW_THRESHOLD_RAD = 0.2   # ~11°, if it is higher it is looking at the poster
+PITCH_LIMIT_LOW = -1.0    # Pitch value if it is looking to foot
+PITCH_LIMIT_HIGH = 0.5    # Pitch value if it is looking ceiling
 
-# 2. CARICAMENTO DATI
+# 2. DATA LOG
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(base_dir, "dataset iniziali e risultati")
@@ -67,16 +67,16 @@ df_cones_all.rename(columns={"id_soggetto": "Subject",
 df_vis_all.rename(columns={"id_soggetto": "Subject",
                            "frame": "Frame"}, inplace=True)
 
-# 3. FILTRAGGIO
+# 3. FILTER
 def apply_lowpass(signal, cutoff_hz, fs):
     """
-    Simula l'analisi spettrale isolando le componenti < 1Hz
+    SPECTRAL ANALYSIS < 1Hz
     """
     nyq = 0.5 * fs
     normal_cutoff = cutoff_hz / nyq
     b, a = butter(4, normal_cutoff, btype="low", analog=False)
 
-    # Gestione NaN
+    # NaN VALUE
     sig = np.asarray(signal, dtype=float)
     nans = np.isnan(sig)
     if np.any(nans):
@@ -85,28 +85,28 @@ def apply_lowpass(signal, cutoff_hz, fs):
 
     return filtfilt(b, a, sig)
 
-# 4. CALCOLO ENERGIA & CLUSTERING
+# 4. ENERGY & CLUSTERING
 
 def process_subject_physics(df):
     df = df.sort_values("Frame").reset_index(drop=True).copy()
 
-    # Interpolazione
+    # Interpolation
     cols = ["child_keypoint_x", "child_keypoint_y", "child_keypoint_z",
             "yaw", "pitch"]
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce').interpolate(method='linear')
 
-    # Calcolo Energia Cinetica
+    # new time set
     dt = 1.0 / FPS
 
-    # Traslazionale (Convert mm -> m)
+    # Convert mm -> m
     v_sq = ((df["child_keypoint_x"] / 1000).diff() / dt) ** 2 + \
            ((df["child_keypoint_y"] / 1000).diff() / dt) ** 2 + \
            ((df["child_keypoint_z"] / 1000).diff() / dt) ** 2
     e_trans = 0.5 * HEAD_MASS_KG * v_sq
 
-    # Rotazionale
+    # Rotational
     yaw_uw = np.unwrap(df["yaw"].fillna(0))
     pitch_uw = np.unwrap(df["pitch"].fillna(0))
     w_sq = (np.diff(yaw_uw, prepend=yaw_uw[0]) / dt) ** 2 + \
@@ -115,24 +115,24 @@ def process_subject_physics(df):
 
     df["Energy_Total"] = (e_trans + e_rot).fillna(0)
 
-    # Filtro 1Hz per isolare movimenti lenti
+    # 1 Hz filter
     df["Energy_LP"] = apply_lowpass(df["Energy_Total"], CUTOFF_HZ, FPS)
 
     return df
 
 
-print("Calcolo Energia...")
+print("calcola energia...")
 df_cones_all = df_cones_all.groupby("Subject", group_keys=False).apply(process_subject_physics)
 
 
 def get_movement_clusters(df_subj):
     """
-    Usa DBSCAN per trovare 'temporal slices' di movimento significativo, mi da come output una lista
+    DBSCAN to find the 'temporal slices'
     """
     energy = df_subj["Energy_LP"].values
     threshold = np.nanpercentile(energy, 75)  # Soglia di 75?
 
-    # Frame attivi
+    # active frame
     active_mask = energy > threshold
     if not np.any(active_mask):
         return []
@@ -152,7 +152,7 @@ def get_movement_clusters(df_subj):
             continue
         cluster_times = times[db.labels_ == label]
 
-        # Anzalone: "center of the cluster... considered as response event" [cite: 197]
+        # Anzalone: "center of the cluster... considered as response event"
         clusters.append({
             'center': np.mean(cluster_times),
             'start': np.min(cluster_times),
@@ -161,25 +161,24 @@ def get_movement_clusters(df_subj):
 
     return sorted(clusters, key=lambda x: x['center'])
 
-# 5. MATCHING & VALIDAZIONE DIREZIONALE
-
+# 5.
 def validate_cluster_direction(cluster, df_subj):
     """
-    Controlla se durante il cluster di movimento (energia), la testa si è girata
+    check if during the movement cluster the head is looking at something
+
     """
     start_f = int(cluster['start'] * FPS)
     end_f = int(cluster['end'] * FPS)
 
-    # Estrai i dati durante il movimento
     segment = df_subj[(df_subj["Frame"] >= start_f) & (df_subj["Frame"] <= end_f)]
 
     if segment.empty:
         return False
 
-    # Controlla se Yaw devia dal centro (Look Left/Right)
+    # chek yaw (look left/right)
     max_yaw_deviation = segment["yaw"].abs().max()
 
-    # Controlla se Pitch è ragionevole (non guarda i piedi/soffitto)
+    # check pitch
     mean_pitch = segment["pitch"].mean()
 
     is_lateral = max_yaw_deviation > YAW_THRESHOLD_RAD
@@ -190,28 +189,23 @@ def validate_cluster_direction(cluster, df_subj):
 
 def compute_ja_metrics(df_events, df_cones):
     """
-    metriche per SOGGETTO *E* ADMIN (Robot / Therapist).
+    robot / therapist
     """
     results = []
 
-    # Raggruppiamo per soggetto e Admin, così otteniamo metriche separate
     for (subj, admin), subj_events in df_events.groupby(["Subject", "Admin"]):
-        # Se Admin è mancante, salta
+
         if pd.isna(admin):
             continue
 
-        # Se il soggetto non esiste nei dati cinematici, salta
         if subj not in df_cones["Subject"].values:
             continue
 
-        # 1. Trova Cluster di Movimento (Energia) per il soggetto
         subj_cones = df_cones[df_cones["Subject"] == subj]
         clusters = get_movement_clusters(subj_cones)
 
-        # 2. Filtra Cluster: tieni solo quelli DIREZIONALI voglio verificare anche che non
         valid_clusters = [c for c in clusters if validate_cluster_direction(c, subj_cones)]
 
-        # 3. Prendi solo eventi di induzione per quel soggetto e Admin
         inductions = subj_events[subj_events["Azione"].isin(["Coniglio", "Indica"])].sort_values("Frame")
 
         n_stimuli = len(inductions)
@@ -220,8 +214,6 @@ def compute_ja_metrics(df_events, df_cones):
 
         for _, stim in inductions.iterrows():
             stim_time = stim["Frame"] / FPS
-
-            # Cerca il cluster valido più vicino DOPO lo stimolo entro la finestra
             candidates = [c for c in valid_clusters
                           if stim_time < c['center'] <= (stim_time + RESPONSE_WINDOW_SEC)]
 
@@ -230,7 +222,6 @@ def compute_ja_metrics(df_events, df_cones):
                 n_responses += 1
                 latencies.append(match['center'] - stim_time)
 
-        # Salva metriche per soggetto+Admin
         results.append({
             "Subject": subj,
             "Group": subj_events["Group"].iloc[0],
@@ -244,13 +235,13 @@ def compute_ja_metrics(df_events, df_cones):
     return pd.DataFrame(results)
 
 
-print("Calcolo Metriche JA...")
+print("Find JA...")
 df_results = compute_ja_metrics(df_vis_all, df_cones_all)
 
 
-# 6. STATISTICA & PLOT
+# 6. STATISTIC AND PLOT
 
-print("\n=== RISULTATI JA RESPONSE (Anzalone 2019, per Admin) ===")
+print("\n=== JA RESPONSE (Anzalone 2019, per Admin) ===")
 
 if not df_results.empty:
     for admin in sorted(df_results["Admin"].dropna().unique()):
@@ -265,9 +256,9 @@ if not df_results.empty:
                 u, p = mannwhitneyu(asd, td)
                 print(f"{metric}: ASD mean={asd.mean():.2f} | TD mean={td.mean():.2f} | p={p:.4f}")
             else:
-                print(f"{metric}: Dati insufficienti (Admin={admin})")
+                print(f"{metric}: Dati insuff. (Admin={admin})")
 else:
-    print("Nessun risultato calcolato (df_results vuoto).")
+    print("df_results empty")
 
 # PLOT
 if not df_results.empty:
@@ -290,7 +281,6 @@ if not df_results.empty:
     plt.tight_layout()
     plt.show()
 
-# (opzionale) salvataggio risultati
 out_dir = os.path.join(base_dir, "results_JA")
 os.makedirs(out_dir, exist_ok=True)
 df_results.to_excel(os.path.join(out_dir, "JA_metrics_by_subject_admin.xlsx"), index=False)

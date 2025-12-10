@@ -1,35 +1,27 @@
 import os
 import numpy as np
 import pandas as pd
-from sklearn.cluster import DBSCAN
 from scipy.stats import mannwhitneyu
-# ============================================================
+
 # 1. SETUP PATHS
-# ============================================================
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(base_dir, "dataset iniziali e risultati")
 
-# File names produced by the cleaning script
 TD_FILENAME = "TD_cleaned_advanced.xlsx"
 ASD_FILENAME = "ASD_cleaned_advanced.xlsx"
 
 path_TD = os.path.join(DATA_DIR, TD_FILENAME)
 path_ASD= os.path.join(DATA_DIR, ASD_FILENAME)
 
-# ============================================================
 # 2. PHYSICAL CONSTANTS (as in Anzalone)
-# ============================================================
 
-TOTAL_MASS_KG  = 25.0                 # approximate body mass
+TOTAL_MASS_KG  = 25.0                 #body mass
 HEAD_MASS_KG   = TOTAL_MASS_KG * 0.0668
 HEAD_RADIUS_M  = 0.0835               # 8.35 cm
 HEAD_INERTIA   = 0.4 * HEAD_MASS_KG * (HEAD_RADIUS_M ** 2)
 
-
-# ============================================================
-# 3. METRICS FOR ONE SUBJECT
-# ============================================================
+# 3. METRICS
 
 def compute_metrics_for_subject(df_subj):
     """
@@ -47,9 +39,8 @@ def compute_metrics_for_subject(df_subj):
     # Sort by time
     df = df_subj.sort_values("timestamp").copy()
 
-    # -----------------------------
     # 3.1 GAZING STD (yaw, pitch)
-    # ----------------------------
+
     if "yaw" not in df.columns or "pitch" not in df.columns:
         return np.nan
     yaw   = df["yaw"].astype(float)
@@ -58,22 +49,22 @@ def compute_metrics_for_subject(df_subj):
         return np.nan
     yaw_centered = yaw - yaw.mean()
     pitch_centered = pitch - pitch.mean()
-    # Gaze magnitude as in the paper: magnitude of (yaw, pitch) in angle space
+
+    # Gaze magnitude: magnitude of (yaw, pitch) in angle space
     gaze_mag = np.sqrt(yaw_centered**2 + pitch_centered**2)
 
     gazing_std_yaw   = float(np.nanstd(yaw_centered))
     gazing_std_pitch = float(np.nanstd(pitch_centered))
     gazing_std_mag   = float(np.nanstd(gaze_mag))
 
-    # -----------------------------
-    # 3.2 DISPLACEMENT STD (child)
-    # -----------------------------
+    # 3.2 DISPLACEMENT STD
+
     # Convert child keypoints from mm to meters
     x_m = df["child_keypoint_x"].astype(float) / 1000.0
     y_m = df["child_keypoint_y"].astype(float) / 1000.0
     z_m = df["child_keypoint_z"].astype(float) / 1000.0
 
-    # Center around subject-specific mean (personal barycenter)
+    # Center around subject-specific mean (barycenter)
     x0 = x_m - np.nanmean(x_m)
     y0 = y_m - np.nanmean(y_m)
     z0 = z_m - np.nanmean(z_m)
@@ -83,16 +74,14 @@ def compute_metrics_for_subject(df_subj):
 
     displacement_std_mag = float(np.nanstd(disp_mag))
     displacement_std_LR  = float(np.nanstd(x0))   # Left-Right
-    displacement_std_FB  = float(np.nanstd(z0))   # Front-Back (depth)
+    displacement_std_FB  = float(np.nanstd(z0))   # Front-Back
 
-    # -----------------------------
     # 3.3 HEAD KINETIC ENERGY
-    # -----------------------------
     # Time difference between frames
     dt = df["timestamp"].diff().astype(float)
     valid = dt > 0
 
-    # Translational velocity in 3D (head position)
+    # Translational velocity in 3D
     dx = x_m.diff()
     dy = y_m.diff()
     dz = z_m.diff()
@@ -122,7 +111,6 @@ def compute_metrics_for_subject(df_subj):
 
     median_head_energy = float(np.nanmedian(energy_total))
 
-    # Pack everything into a dict
     metrics = {
         "GazingStd_mag": gazing_std_mag,
         "GazingStd_yaw": gazing_std_yaw,
@@ -136,14 +124,12 @@ def compute_metrics_for_subject(df_subj):
     return metrics
 
 
-# ============================================================
-# 4. PROCESS WHOLE GROUP
-# ============================================================
+# 4. PROCESS
 
 def process_group(path, group_label):
     """
     Load one group (TD or ASD), split by subject,
-    compute metrics for each subject.
+    compute metrics for each subject
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"File not found: {path}")
@@ -160,10 +146,7 @@ def process_group(path, group_label):
 
     return pd.DataFrame(summary_rows)
 
-
-# ============================================================
 # 5. RUN FOR TD + ASD AND SAVE SUMMARY
-# ============================================================
 
 df_TD  = process_group(path_TD, "TD")
 df_ASD = process_group(path_ASD, "ASD")
@@ -176,10 +159,7 @@ df_summary.to_excel(out_summary, index=False)
 print("Saved per-subject metrics to:", out_summary)
 print(df_summary.head())
 
-
-# ============================================================
-# 6. STATISTICAL TESTS (ASD vs TD) – MANN–WHITNEY
-# ============================================================
+# 6. STATISTICAL– MANN–WHITNEY
 
 metrics_to_test = [
     "GazingStd_mag",
@@ -194,7 +174,7 @@ metrics_to_test = [
 results = []
 
 for metric in metrics_to_test:
-    # Drop NaNs (if any)
+
     df_valid = df_summary.dropna(subset=[metric])
 
     ASD_values = df_valid[df_valid["Group"] == "ASD"][metric].values
@@ -221,7 +201,6 @@ for metric in metrics_to_test:
         "TD_median": float(np.median(TD_values))
     })
 
-# Save stats summary
 if results:
     df_stats = pd.DataFrame(results)
     out_stats = os.path.join(base_dir, "Anzalone_like_metrics_stats.xlsx")
