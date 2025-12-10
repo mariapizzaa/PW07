@@ -33,15 +33,15 @@ HEAD_INERTIA   = 0.4 * HEAD_MASS_KG * (HEAD_RADIUS_M ** 2)
 
 def compute_metrics_for_subject(df_subj):
     """
-    Compute JA-related kinematic metrics for a single subject:
+    Compute JA-related metrics for a single subject:
 
     - Gazing std (magnitude, yaw, pitch)
     - Displacement std (magnitude, left-right, front-back)
     - Median head kinetic energy (translational + rotational)
 
     This follows the spirit of Anzalone et al. (2019),
-    where these kinematic markers are used to characterize
-    JA-related behavior (without using AOIs explicitly).
+    where these markers are used to characterize
+    JA-related behavior
     """
 
     # Sort by time
@@ -50,14 +50,19 @@ def compute_metrics_for_subject(df_subj):
     # -----------------------------
     # 3.1 GAZING STD (yaw, pitch)
     # ----------------------------
+    if "yaw" not in df.columns or "pitch" not in df.columns:
+        return np.nan
     yaw   = df["yaw"].astype(float)
     pitch = df["pitch"].astype(float)
-
+    if len(yaw) == 0:
+        return np.nan
+    yaw_centered = yaw - yaw.mean()
+    pitch_centered = pitch - pitch.mean()
     # Gaze magnitude as in the paper: magnitude of (yaw, pitch) in angle space
-    gaze_mag = np.sqrt(yaw**2 + pitch**2)
+    gaze_mag = np.sqrt(yaw_centered**2 + pitch_centered**2)
 
-    gazing_std_yaw   = float(np.nanstd(yaw))
-    gazing_std_pitch = float(np.nanstd(pitch))
+    gazing_std_yaw   = float(np.nanstd(yaw_centered))
+    gazing_std_pitch = float(np.nanstd(pitch_centered))
     gazing_std_mag   = float(np.nanstd(gaze_mag))
 
     # -----------------------------
