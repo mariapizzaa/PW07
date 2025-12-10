@@ -12,52 +12,39 @@ TD_FILENAME = "TD_cleaned_advanced.xlsx"
 ASD_FILENAME = "ASD_cleaned_advanced.xlsx"
 
 path_TD = os.path.join(DATA_DIR, TD_FILENAME)
-path_ASD= os.path.join(DATA_DIR, ASD_FILENAME)
+path_ASD = os.path.join(DATA_DIR, ASD_FILENAME)
 
 # 2. PHYSICAL CONSTANTS (as in Anzalone)
 
-TOTAL_MASS_KG  = 25.0                 #body mass
-HEAD_MASS_KG   = TOTAL_MASS_KG * 0.0668
-HEAD_RADIUS_M  = 0.0835               # 8.35 cm
-HEAD_INERTIA   = 0.4 * HEAD_MASS_KG * (HEAD_RADIUS_M ** 2)
+TOTAL_MASS_KG = 25.0  # body mass
+HEAD_MASS_KG = TOTAL_MASS_KG * 0.0668
+HEAD_RADIUS_M = 0.0835  # 8.35 cm
+HEAD_INERTIA = 0.4 * HEAD_MASS_KG * (HEAD_RADIUS_M ** 2)
+
 
 # 3. METRICS
 
 def compute_metrics_for_subject(df_subj):
     """
-    Compute JA-related metrics for a single subject:
-
-    - Gazing std (magnitude, yaw, pitch)
+    Compute metrics for a single subject:
     - Displacement std (magnitude, left-right, front-back)
     - Median head kinetic energy (translational + rotational)
-
-    This follows the spirit of Anzalone et al. (2019),
-    where these markers are used to characterize
-    JA-related behavior
     """
 
     # Sort by time
     df = df_subj.sort_values("timestamp").copy()
 
-    # 3.1 GAZING STD (yaw, pitch)
-
+    # Controlliamo che ci siano le colonne necessarie per l'energia rotazionale
     if "yaw" not in df.columns or "pitch" not in df.columns:
         return np.nan
-    yaw   = df["yaw"].astype(float)
+
+    yaw = df["yaw"].astype(float)
     pitch = df["pitch"].astype(float)
+
     if len(yaw) == 0:
         return np.nan
-    yaw_centered = yaw - yaw.mean()
-    pitch_centered = pitch - pitch.mean()
 
-    # Gaze magnitude: magnitude of (yaw, pitch) in angle space
-    gaze_mag = np.sqrt(yaw_centered**2 + pitch_centered**2)
-
-    gazing_std_yaw   = float(np.nanstd(yaw_centered))
-    gazing_std_pitch = float(np.nanstd(pitch_centered))
-    gazing_std_mag   = float(np.nanstd(gaze_mag))
-
-    # 3.2 DISPLACEMENT STD
+    # 3.1 DISPLACEMENT STD
 
     # Convert child keypoints from mm to meters
     x_m = df["child_keypoint_x"].astype(float) / 1000.0
@@ -70,13 +57,13 @@ def compute_metrics_for_subject(df_subj):
     z0 = z_m - np.nanmean(z_m)
 
     # Displacement magnitude (3D)
-    disp_mag = np.sqrt(x0**2 + y0**2 + z0**2)
+    disp_mag = np.sqrt(x0 ** 2 + y0 ** 2 + z0 ** 2)
 
     displacement_std_mag = float(np.nanstd(disp_mag))
-    displacement_std_LR  = float(np.nanstd(x0))   # Left-Right
-    displacement_std_FB  = float(np.nanstd(z0))   # Front-Back
+    displacement_std_LR = float(np.nanstd(x0))  # Left-Right
+    displacement_std_FB = float(np.nanstd(z0))  # Front-Back
 
-    # 3.3 HEAD KINETIC ENERGY
+    # 3.2 HEAD KINETIC ENERGY
     # Time difference between frames
     dt = df["timestamp"].diff().astype(float)
     valid = dt > 0
@@ -86,21 +73,21 @@ def compute_metrics_for_subject(df_subj):
     dy = y_m.diff()
     dz = z_m.diff()
 
-    dist_sq = dx**2 + dy**2 + dz**2
+    dist_sq = dx ** 2 + dy ** 2 + dz ** 2
 
     vel_sq = np.full(len(df), np.nan)
     vel_sq[valid] = dist_sq[valid] / (dt[valid] ** 2)
 
     energy_trans = 0.5 * HEAD_MASS_KG * vel_sq
 
-    # Rotational velocity from yaw & pitch
-    d_yaw   = yaw.diff()
+    # Rotational velocity from yaw & pitch (needed for Total Energy)
+    d_yaw = yaw.diff()
     d_pitch = pitch.diff()
 
     # Unwrap yaw to avoid jumps over ±pi
     d_yaw = np.arctan2(np.sin(d_yaw), np.cos(d_yaw))
 
-    ang_dist_sq = d_yaw**2 + d_pitch**2
+    ang_dist_sq = d_yaw ** 2 + d_pitch ** 2
 
     ang_vel_sq = np.full(len(df), np.nan)
     ang_vel_sq[valid] = ang_dist_sq[valid] / (dt[valid] ** 2)
@@ -112,9 +99,6 @@ def compute_metrics_for_subject(df_subj):
     median_head_energy = float(np.nanmedian(energy_total))
 
     metrics = {
-        "GazingStd_mag": gazing_std_mag,
-        "GazingStd_yaw": gazing_std_yaw,
-        "GazingStd_pitch": gazing_std_pitch,
         "DisplacementStd_mag": displacement_std_mag,
         "DisplacementStd_LR": displacement_std_LR,
         "DisplacementStd_FB": displacement_std_FB,
@@ -140,31 +124,32 @@ def process_group(path, group_label):
 
     for subj_id, df_subj in df.groupby("id_soggetto"):
         metrics = compute_metrics_for_subject(df_subj)
-        metrics["Subject_ID"] = subj_id
-        metrics["Group"] = group_label
-        summary_rows.append(metrics)
+        # Se metrics è nan (es. colonne mancanti), saltiamo o gestiamo
+        if isinstance(metrics, dict):
+            metrics["Subject_ID"] = subj_id
+            metrics["Group"] = group_label
+            summary_rows.append(metrics)
 
     return pd.DataFrame(summary_rows)
 
+
 # 5. RUN FOR TD + ASD AND SAVE SUMMARY
 
-df_TD  = process_group(path_TD, "TD")
+df_TD = process_group(path_TD, "TD")
 df_ASD = process_group(path_ASD, "ASD")
 
 df_summary = pd.concat([df_TD, df_ASD], ignore_index=True)
 
-out_summary = os.path.join(base_dir, "Anzalone_like_metrics_summary.xlsx")
+out_summary = os.path.join(base_dir, "Metrics_Displacement_Energy_Summary.xlsx")
 df_summary.to_excel(out_summary, index=False)
 
 print("Saved per-subject metrics to:", out_summary)
 print(df_summary.head())
 
-# 6. STATISTICAL– MANN–WHITNEY
+# 6. STATISTICAL – MANN–WHITNEY
 
+# Removed Gazing metrics from this list
 metrics_to_test = [
-    "GazingStd_mag",
-    "GazingStd_yaw",
-    "GazingStd_pitch",
     "DisplacementStd_mag",
     "DisplacementStd_LR",
     "DisplacementStd_FB",
@@ -178,7 +163,7 @@ for metric in metrics_to_test:
     df_valid = df_summary.dropna(subset=[metric])
 
     ASD_values = df_valid[df_valid["Group"] == "ASD"][metric].values
-    TD_values  = df_valid[df_valid["Group"] == "TD"][metric].values
+    TD_values = df_valid[df_valid["Group"] == "TD"][metric].values
 
     if len(ASD_values) == 0 or len(TD_values) == 0:
         print(f"\n[{metric}] Not enough data for test.")
@@ -203,7 +188,7 @@ for metric in metrics_to_test:
 
 if results:
     df_stats = pd.DataFrame(results)
-    out_stats = os.path.join(base_dir, "Anzalone_like_metrics_stats.xlsx")
+    out_stats = os.path.join(base_dir, "Metrics_Displacement_Energy_Stats.xlsx")
     df_stats.to_excel(out_stats, index=False)
     print("\nStatistical results saved to:", out_stats)
 else:
